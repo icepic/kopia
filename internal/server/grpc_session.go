@@ -187,12 +187,13 @@ func handleGetContentInfoRequest(ctx context.Context, dw repo.DirectRepositoryWr
 			GetContentInfo: &grpcapi.GetContentInfoResponse{
 				Info: &grpcapi.ContentInfo{
 					Id:               string(ci.ID),
-					Length:           ci.Length,
+					PackedLength:     ci.PackedLength,
 					TimestampSeconds: ci.TimestampSeconds,
 					PackBlobId:       string(ci.PackBlobID),
 					PackOffset:       ci.PackOffset,
 					Deleted:          ci.Deleted,
 					FormatVersion:    uint32(ci.FormatVersion),
+					OriginalLength:   ci.OriginalLength,
 				},
 			},
 		},
