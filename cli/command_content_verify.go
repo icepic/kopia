@@ -11,13 +11,23 @@ import (
 	"github.com/kopia/kopia/repo/content"
 )
 
-var (
-	contentVerifyCommand = contentCommands.Command("verify", "Verify that each content is backed by a valid blob")
+type commandContentVerify struct {
+	contentVerifyParallel       int
+	contentVerifyFull           bool
+	contentVerifyIncludeDeleted bool
 
-	contentVerifyParallel       = contentVerifyCommand.Flag("parallel", "Parallelism").Default("16").Int()
-	contentVerifyFull           = contentVerifyCommand.Flag("full", "Full verification (including download)").Bool()
-	contentVerifyIncludeDeleted = contentVerifyCommand.Flag("include-deleted", "Include deleted contents").Bool()
-)
+	contentRange contentRangeFlags
+}
+
+func (c *commandContentVerify) setup(svc appServices, parent commandParent) {
+	cmd := parent.Command("verify", "Verify that each content is backed by a valid blob")
+
+	cmd.Flag("parallel", "Parallelism").Default("16").IntVar(&c.contentVerifyParallel)
+	cmd.Flag("full", "Full verification (including download)").BoolVar(&c.contentVerifyFull)
+	cmd.Flag("include-deleted", "Include deleted contents").BoolVar(&c.contentVerifyIncludeDeleted)
+	c.contentRange.setup(cmd)
+	cmd.Action(svc.directRepositoryReadAction(c.run))
+}
 
 func readBlobMap(ctx context.Context, br blob.Reader) (map[blob.ID]blob.Metadata, error) {
 	blobMap := map[blob.ID]blob.Metadata{}
@@ -39,10 +49,10 @@ func readBlobMap(ctx context.Context, br blob.Reader) (map[blob.ID]blob.Metadata
 	return blobMap, nil
 }
 
-func runContentVerifyCommand(ctx context.Context, rep repo.DirectRepository) error {
+func (c *commandContentVerify) run(ctx context.Context, rep repo.DirectRepository) error {
 	blobMap := map[blob.ID]blob.Metadata{}
 
-	if !*contentVerifyFull {
+	if !c.contentVerifyFull {
 		m, err := readBlobMap(ctx, rep.BlobReader())
 		if err != nil {
 			return err
@@ -56,11 +66,11 @@ func runContentVerifyCommand(ctx context.Context, rep repo.DirectRepository) err
 	log(ctx).Infof("Verifying all contents...")
 
 	err := rep.ContentReader().IterateContents(ctx, content.IterateOptions{
-		Range:          contentIDRange(),
-		Parallel:       *contentVerifyParallel,
-		IncludeDeleted: *contentVerifyIncludeDeleted,
+		Range:          c.contentRange.contentIDRange(),
+		Parallel:       c.contentVerifyParallel,
+		IncludeDeleted: c.contentVerifyIncludeDeleted,
 	}, func(ci content.Info) error {
-		if err := contentVerify(ctx, rep.ContentReader(), &ci, blobMap); err != nil {
+		if err := c.contentVerify(ctx, rep.ContentReader(), ci, blobMap); err != nil {
 			log(ctx).Errorf("error %v", err)
 			atomic.AddInt32(&errorCount, 1)
 		} else {
@@ -86,28 +96,23 @@ func runContentVerifyCommand(ctx context.Context, rep repo.DirectRepository) err
 	return errors.Errorf("encountered %v errors", errorCount)
 }
 
-func contentVerify(ctx context.Context, r content.Reader, ci *content.Info, blobMap map[blob.ID]blob.Metadata) error {
-	if *contentVerifyFull {
-		if _, err := r.GetContent(ctx, ci.ID); err != nil {
-			return errors.Wrapf(err, "content %v is invalid", ci.ID)
+func (c *commandContentVerify) contentVerify(ctx context.Context, r content.Reader, ci content.Info, blobMap map[blob.ID]blob.Metadata) error {
+	if c.contentVerifyFull {
+		if _, err := r.GetContent(ctx, ci.GetContentID()); err != nil {
+			return errors.Wrapf(err, "content %v is invalid", ci.GetContentID())
 		}
 
 		return nil
 	}
 
-	bi, ok := blobMap[ci.PackBlobID]
+	bi, ok := blobMap[ci.GetPackBlobID()]
 	if !ok {
-		return errors.Errorf("content %v depends on missing blob %v", ci.ID, ci.PackBlobID)
+		return errors.Errorf("content %v depends on missing blob %v", ci.GetContentID(), ci.GetPackBlobID())
 	}
 
-	if int64(ci.PackOffset+ci.PackedLength) > bi.Length {
-		return errors.Errorf("content %v out of bounds of its pack blob %v", ci.ID, ci.PackBlobID)
+	if int64(ci.GetPackOffset()+ci.GetPackedLength()) > bi.Length {
+		return errors.Errorf("content %v out of bounds of its pack blob %v", ci.GetContentID(), ci.GetPackBlobID())
 	}
 
 	return nil
-}
-
-func init() {
-	contentVerifyCommand.Action(directRepositoryReadAction(runContentVerifyCommand))
-	setupContentIDRangeFlags(contentVerifyCommand)
 }
