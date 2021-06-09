@@ -141,7 +141,7 @@ func longLivedRepositoryTest(ctx context.Context, t *testing.T, cancel chan stru
 	}
 	defer rep.Close(ctx)
 
-	w, err := rep.(repo.DirectRepository).NewDirectWriter(ctx, repo.WriteSessionOptions{Purpose: "longLivedRepositoryTest"})
+	_, w, err := rep.(repo.DirectRepository).NewDirectWriter(ctx, repo.WriteSessionOptions{Purpose: "longLivedRepositoryTest"})
 	if err != nil {
 		t.Errorf("error opening writer: %v", err)
 		return
@@ -233,7 +233,7 @@ func writeRandomBlock(ctx context.Context, t *testing.T, r repo.DirectRepository
 	data := make([]byte, 1000)
 	cryptorand.Read(data)
 
-	contentID, err := r.ContentManager().WriteContent(ctx, data, "")
+	contentID, err := r.ContentManager().WriteContent(ctx, data, "", content.NoCompression)
 	if err == nil {
 		knownBlocksMutex.Lock()
 		if len(knownBlocks) >= 1000 {

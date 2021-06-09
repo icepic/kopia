@@ -11,6 +11,7 @@ import (
 	"github.com/kopia/kopia/internal/testlogging"
 	"github.com/kopia/kopia/internal/testutil"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/logging"
 )
 
 func TestCommittedContentIndexCache_Disk(t *testing.T) {
@@ -18,7 +19,7 @@ func TestCommittedContentIndexCache_Disk(t *testing.T) {
 
 	ta := faketime.NewClockTimeWithOffset(0)
 
-	testCache(t, &diskCommittedContentIndexCache{testutil.TempDirectory(t), ta.NowFunc(), 3}, ta)
+	testCache(t, &diskCommittedContentIndexCache{testutil.TempDirectory(t), ta.NowFunc(), 3, logging.Printf(t.Logf)("test")}, ta)
 }
 
 func TestCommittedContentIndexCache_Memory(t *testing.T) {
@@ -116,7 +117,7 @@ func mustBuildPackIndex(t *testing.T, b packIndexBuilder) []byte {
 	t.Helper()
 
 	var buf bytes.Buffer
-	if err := b.Build(&buf); err != nil {
+	if err := b.Build(&buf, v2IndexVersion); err != nil {
 		t.Fatal(err)
 	}
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,6 +63,7 @@ func (s *sftpImpl) GetBlobFromPath(ctx context.Context, dirPath, fullPath string
 
 	if length < 0 {
 		// read entire blob
+		// nolint:wrapcheck
 		return ioutil.ReadAll(r)
 	}
 
@@ -86,6 +88,7 @@ func (s *sftpImpl) GetBlobFromPath(ctx context.Context, dirPath, fullPath string
 		return nil, errors.Wrap(err, "read error")
 	}
 
+	// nolint:wrapcheck
 	return blob.EnsureLengthExactly(b, length)
 }
 
@@ -139,6 +142,7 @@ func (s *sftpImpl) PutBlobInPath(ctx context.Context, dirPath, fullPath string, 
 }
 
 func (s *sftpImpl) SetTimeInPath(ctx context.Context, dirPath, fullPath string, n time.Time) error {
+	// nolint:wrapcheck
 	return s.cli.Chtimes(fullPath, n, n)
 }
 
@@ -152,6 +156,7 @@ func (s *sftpImpl) createTempFileAndDir(tempFile string) (*sftp.File, error) {
 			return nil, errors.Wrap(err, "cannot create directory")
 		}
 
+		// nolint:wrapcheck
 		return s.cli.OpenFile(tempFile, flags)
 	}
 
@@ -180,6 +185,7 @@ func (s *sftpImpl) DeleteBlobInPath(ctx context.Context, dirPath, fullPath strin
 }
 
 func (s *sftpImpl) ReadDir(ctx context.Context, dirname string) ([]os.FileInfo, error) {
+	// nolint:wrapcheck
 	return s.cli.ReadDir(dirname)
 }
 
@@ -236,9 +242,15 @@ func getHostKeyCallback(opt *Options) (ssh.HostKeyCallback, error) {
 		// this file is no longer needed after `knownhosts.New` returns, so we can delete it.
 		defer os.Remove(tmpFile) // nolint:errcheck
 
+		// nolint:wrapcheck
 		return knownhosts.New(tmpFile)
 	}
 
+	if f := opt.knownHostsFile(); !filepath.IsAbs(f) {
+		return nil, errors.Errorf("known hosts path must be absolute")
+	}
+
+	// nolint:wrapcheck
 	return knownhosts.New(opt.knownHostsFile())
 }
 
@@ -254,6 +266,10 @@ func getSigner(opts *Options) (ssh.Signer, error) {
 		privateKeyData = []byte(opts.KeyData)
 	} else {
 		var err error
+
+		if f := opts.Keyfile; !filepath.IsAbs(f) {
+			return nil, errors.Errorf("key file path must be absolute")
+		}
 
 		privateKeyData, err = ioutil.ReadFile(opts.Keyfile)
 		if err != nil {

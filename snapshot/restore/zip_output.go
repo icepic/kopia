@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/fs"
+	"github.com/kopia/kopia/snapshot"
 )
 
 // ZipOutput contains the options for outputting a file system tree to a zip file.
@@ -32,12 +33,18 @@ func (o *ZipOutput) FinishDirectory(ctx context.Context, relativePath string, e 
 	return nil
 }
 
+// WriteDirEntry implements restore.Output interface.
+func (o *ZipOutput) WriteDirEntry(ctx context.Context, relativePath string, de *snapshot.DirEntry, e fs.Directory) error {
+	return nil
+}
+
 // Close implements restore.Output interface.
 func (o *ZipOutput) Close(ctx context.Context) error {
 	if err := o.zf.Close(); err != nil {
 		return errors.Wrap(err, "error closing zip")
 	}
 
+	// nolint:wrapcheck
 	return o.w.Close()
 }
 
@@ -89,3 +96,5 @@ func (o *ZipOutput) SymlinkExists(ctx context.Context, relativePath string, l fs
 func NewZipOutput(w io.WriteCloser, method uint16) *ZipOutput {
 	return &ZipOutput{w, zip.NewWriter(w), method}
 }
+
+var _ Output = (*ZipOutput)(nil)

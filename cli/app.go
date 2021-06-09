@@ -3,8 +3,12 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/alecthomas/kingpin"
@@ -12,6 +16,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/apiclient"
+	"github.com/kopia/kopia/internal/passwordpersist"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/logging"
@@ -27,6 +32,43 @@ var (
 	errorColor   = color.New(color.FgHiRed)
 )
 
+type textOutput struct {
+	svc appServices
+}
+
+func (o *textOutput) setup(svc appServices) {
+	s := string(debug.Stack())
+	if strings.Contains(s, "cliProgress") {
+		fmt.Printf("setting up %s with %v\n", debug.Stack(), svc.stdout())
+	}
+
+	o.svc = svc
+}
+
+func (o *textOutput) stdout() io.Writer {
+	if o.svc == nil {
+		return os.Stdout
+	}
+
+	return o.svc.stdout()
+}
+
+func (o *textOutput) stderr() io.Writer {
+	if o.svc == nil {
+		return os.Stderr
+	}
+
+	return o.svc.stderr()
+}
+
+func (o *textOutput) printStdout(msg string, args ...interface{}) {
+	fmt.Fprintf(o.stdout(), msg, args...)
+}
+
+func (o *textOutput) printStderr(msg string, args ...interface{}) {
+	fmt.Fprintf(o.stderr(), msg, args...)
+}
+
 // appServices are the methods of *App that command handles are allowed to call.
 type appServices interface {
 	noRepositoryAction(act func(ctx context.Context) error) func(ctx *kingpin.ParseContext) error
@@ -37,12 +79,17 @@ type appServices interface {
 	repositoryWriterAction(act func(ctx context.Context, rep repo.RepositoryWriter) error) func(ctx *kingpin.ParseContext) error
 	maybeRepositoryAction(act func(ctx context.Context, rep repo.Repository) error, mode repositoryAccessMode) func(ctx *kingpin.ParseContext) error
 
+	advancedCommand(ctx context.Context)
 	repositoryConfigFileName() string
 	getProgress() *cliProgress
+
+	stdout() io.Writer
+	stderr() io.Writer
 }
 
 type advancedAppServices interface {
 	appServices
+	storageProviderServices
 
 	runConnectCommandWithStorage(ctx context.Context, co *connectOptions, st blob.Storage) error
 	runConnectCommandWithStorageAndPassword(ctx context.Context, co *connectOptions, st blob.Storage, password string) error
@@ -50,8 +97,11 @@ type advancedAppServices interface {
 
 	maybeInitializeUpdateCheck(ctx context.Context, co *connectOptions)
 	removeUpdateState()
+	passwordPersistenceStrategy() passwordpersist.Strategy
 	getPasswordFromFlags(ctx context.Context, isNew, allowPersistent bool) (string, error)
 	optionsFromFlags(ctx context.Context) *repo.Options
+
+	rootContext() context.Context
 }
 
 // App contains per-invocation flags and state of Kopia CLI.
@@ -63,9 +113,16 @@ type App struct {
 	initialUpdateCheckDelay       time.Duration
 	updateCheckInterval           time.Duration
 	updateAvailableNotifyInterval time.Duration
+	password                      string
 	configPath                    string
 	traceStorage                  bool
 	metricsListenAddr             string
+	keyRingEnabled                bool
+	persistCredentials            bool
+	disableInternalLog            bool
+	AdvancedCommands              string
+
+	currentAction string
 
 	// subcommands
 	blob        commandBlob
@@ -85,13 +142,53 @@ type App struct {
 	mount       commandMount
 	maintenance commandMaintenance
 	repository  commandRepository
+	logs        commandLogs
+
+	// testability hooks
+	osExit       func(int) // allows replacing os.Exit() with custom code
+	stdoutWriter io.Writer
+	stderrWriter io.Writer
+	rootctx      context.Context
 }
 
 func (c *App) getProgress() *cliProgress {
 	return c.progress
 }
 
+func (c *App) stdout() io.Writer {
+	return c.stdoutWriter
+}
+
+func (c *App) stderr() io.Writer {
+	return c.stderrWriter
+}
+
+func (c *App) passwordPersistenceStrategy() passwordpersist.Strategy {
+	if !c.persistCredentials {
+		return passwordpersist.None
+	}
+
+	if c.keyRingEnabled {
+		return passwordpersist.Multiple{
+			passwordpersist.Keyring,
+			passwordpersist.File,
+		}
+	}
+
+	return passwordpersist.File
+}
+
 func (c *App) setup(app *kingpin.Application) {
+	app.PreAction(func(pc *kingpin.ParseContext) error {
+		if sc := pc.SelectedCommand; sc != nil {
+			c.currentAction = sc.FullCommand()
+		} else {
+			c.currentAction = "unknown-action"
+		}
+
+		return nil
+	})
+
 	_ = app.Flag("help-full", "Show help for all commands, including hidden").Action(func(pc *kingpin.ParseContext) error {
 		_ = app.UsageForContextWithTemplate(pc, 0, kingpin.DefaultUsageTemplate)
 		os.Exit(0)
@@ -107,21 +204,24 @@ func (c *App) setup(app *kingpin.Application) {
 	app.Flag("config-file", "Specify the config file to use.").Default(defaultConfigFileName()).Envar("KOPIA_CONFIG_PATH").StringVar(&c.configPath)
 	app.Flag("trace-storage", "Enables tracing of storage operations.").Default("true").Hidden().BoolVar(&c.traceStorage)
 	app.Flag("metrics-listen-addr", "Expose Prometheus metrics on a given host:port").Hidden().StringVar(&c.metricsListenAddr)
-	app.Flag("timezone", "Format time according to specified time zone (local, utc, original or time zone name)").Default("local").Hidden().StringVar(&timeZone)
-	app.Flag("password", "Repository password.").Envar("KOPIA_PASSWORD").Short('p').StringVar(&globalPassword)
+	app.Flag("timezone", "Format time according to specified time zone (local, utc, original or time zone name)").Hidden().StringVar(&timeZone)
+	app.Flag("password", "Repository password.").Envar("KOPIA_PASSWORD").Short('p').StringVar(&c.password)
+	app.Flag("persist-credentials", "Persist credentials").Default("true").Envar("KOPIA_PERSIST_CREDENTIALS_ON_CONNECT").BoolVar(&c.persistCredentials)
+	app.Flag("disable-internal-log", "Disable internal log").Hidden().Envar("KOPIA_DISABLE_INTERNAL_LOG").BoolVar(&c.disableInternalLog)
+	app.Flag("advanced-commands", "Enable advanced (and potentially dangerous) commands.").Hidden().Envar("KOPIA_ADVANCED_COMMANDS").StringVar(&c.AdvancedCommands)
 
 	c.setupOSSpecificKeychainFlags(app)
 
 	_ = app.Flag("caching", "Enables caching of objects (disable with --no-caching)").Default("true").Hidden().Action(
-		deprecatedFlag("The '--caching' flag is deprecated and has no effect, use 'kopia cache set' instead."),
+		deprecatedFlag(c.stderrWriter, "The '--caching' flag is deprecated and has no effect, use 'kopia cache set' instead."),
 	).Bool()
 
 	_ = app.Flag("list-caching", "Enables caching of list results (disable with --no-list-caching)").Default("true").Hidden().Action(
-		deprecatedFlag("The '--list-caching' flag is deprecated and has no effect, use 'kopia cache set' instead."),
+		deprecatedFlag(c.stderrWriter, "The '--list-caching' flag is deprecated and has no effect, use 'kopia cache set' instead."),
 	).Bool()
 
 	c.mt.setup(app)
-	c.progress.setup(app)
+	c.progress.setup(c, app)
 
 	c.blob.setup(c, app)
 	c.benchmark.setup(c, app)
@@ -130,6 +230,7 @@ func (c *App) setup(app *kingpin.Application) {
 	c.diff.setup(c, app)
 	c.index.setup(c, app)
 	c.list.setup(c, app)
+	c.logs.setup(c, app)
 	c.server.setup(c, app)
 	c.session.setup(c, app)
 	c.restore.setup(c, app)
@@ -147,15 +248,22 @@ type commandParent interface {
 	Command(name, help string) *kingpin.CmdClause
 }
 
-// Attach creates new App object and attaches all the flags to the provided application.
-func Attach(app *kingpin.Application) *App {
-	a := &App{
+// NewApp creates a new instance of App.
+func NewApp() *App {
+	return &App{
 		progress: &cliProgress{},
+
+		// testability hooks
+		osExit:       os.Exit,
+		stdoutWriter: os.Stdout,
+		stderrWriter: os.Stderr,
+		rootctx:      context.Background(),
 	}
+}
 
-	a.setup(app)
-
-	return a
+// Attach attaches the CLI parser to the application.
+func (c *App) Attach(app *kingpin.Application) {
+	c.setup(app)
 }
 
 var safetyByName = map[string]maintenance.SafetyParameters{
@@ -181,9 +289,13 @@ func safetyFlagVar(cmd *kingpin.CmdClause, result *maintenance.SafetyParameters)
 	}).EnumVar(&str, "full", "none")
 }
 
+func (c *App) currentActionName() string {
+	return c.currentAction
+}
+
 func (c *App) noRepositoryAction(act func(ctx context.Context) error) func(ctx *kingpin.ParseContext) error {
 	return func(_ *kingpin.ParseContext) error {
-		return act(rootContext())
+		return act(c.rootContext())
 	}
 }
 
@@ -199,7 +311,7 @@ func (c *App) serverAction(sf *serverClientFlags, act func(ctx context.Context, 
 			return errors.Wrap(err, "unable to create API client")
 		}
 
-		return act(rootContext(), apiClient)
+		return act(c.rootContext(), apiClient)
 	}
 }
 
@@ -222,10 +334,11 @@ func assertDirectRepository(act func(ctx context.Context, rep repo.DirectReposit
 
 func (c *App) directRepositoryWriteAction(act func(ctx context.Context, rep repo.DirectRepositoryWriter) error) func(ctx *kingpin.ParseContext) error {
 	return c.maybeRepositoryAction(assertDirectRepository(func(ctx context.Context, rep repo.DirectRepository) error {
+		// nolint:wrapcheck
 		return repo.DirectWriteSession(ctx, rep, repo.WriteSessionOptions{
-			Purpose:  "directRepositoryWriteAction",
+			Purpose:  "cli:" + c.currentActionName(),
 			OnUpload: c.progress.UploadedBytes,
-		}, func(dw repo.DirectRepositoryWriter) error { return act(ctx, dw) })
+		}, func(ctx context.Context, dw repo.DirectRepositoryWriter) error { return act(ctx, dw) })
 	}), repositoryAccessMode{
 		mustBeConnected:    true,
 		disableMaintenance: true,
@@ -252,10 +365,11 @@ func (c *App) repositoryReaderAction(act func(ctx context.Context, rep repo.Repo
 
 func (c *App) repositoryWriterAction(act func(ctx context.Context, rep repo.RepositoryWriter) error) func(ctx *kingpin.ParseContext) error {
 	return c.maybeRepositoryAction(func(ctx context.Context, rep repo.Repository) error {
+		// nolint:wrapcheck
 		return repo.WriteSession(ctx, rep, repo.WriteSessionOptions{
-			Purpose:  "repositoryWriterAction",
+			Purpose:  "cli:" + c.currentActionName(),
 			OnUpload: c.progress.UploadedBytes,
-		}, func(w repo.RepositoryWriter) error {
+		}, func(ctx context.Context, w repo.RepositoryWriter) error {
 			return act(ctx, w)
 		})
 	}, repositoryAccessMode{
@@ -263,8 +377,8 @@ func (c *App) repositoryWriterAction(act func(ctx context.Context, rep repo.Repo
 	})
 }
 
-func rootContext() context.Context {
-	return context.Background()
+func (c *App) rootContext() context.Context {
+	return c.rootctx
 }
 
 type repositoryAccessMode struct {
@@ -274,7 +388,7 @@ type repositoryAccessMode struct {
 
 func (c *App) maybeRepositoryAction(act func(ctx context.Context, rep repo.Repository) error, mode repositoryAccessMode) func(ctx *kingpin.ParseContext) error {
 	return func(kpc *kingpin.ParseContext) error {
-		ctx := rootContext()
+		ctx := c.rootContext()
 
 		if err := withProfiling(func() error {
 			c.mt.startMemoryTracking(ctx)
@@ -313,7 +427,7 @@ func (c *App) maybeRepositoryAction(act func(ctx context.Context, rep repo.Repos
 		}); err != nil {
 			// print error in red
 			log(ctx).Errorf("ERROR: %v", err.Error())
-			os.Exit(1)
+			c.osExit(1)
 		}
 
 		return nil
@@ -337,7 +451,8 @@ func (c *App) maybeRunMaintenance(ctx context.Context, rep repo.Repository) erro
 	err := repo.DirectWriteSession(ctx, dr, repo.WriteSessionOptions{
 		Purpose:  "maybeRunMaintenance",
 		OnUpload: c.progress.UploadedBytes,
-	}, func(w repo.DirectRepositoryWriter) error {
+	}, func(ctx context.Context, w repo.DirectRepositoryWriter) error {
+		// nolint:wrapcheck
 		return snapshotmaintenance.Run(ctx, w, maintenance.ModeAuto, false, maintenance.SafetyFull)
 	})
 
@@ -351,15 +466,20 @@ func (c *App) maybeRunMaintenance(ctx context.Context, rep repo.Repository) erro
 	return errors.Wrap(err, "error running maintenance")
 }
 
-func advancedCommand(ctx context.Context) {
-	if os.Getenv("KOPIA_ADVANCED_COMMANDS") != "enabled" {
-		log(ctx).Errorf(`
+func (c *App) advancedCommand(ctx context.Context) {
+	if c.AdvancedCommands != "enabled" {
+		_, _ = errorColor.Fprintf(c.stderrWriter, `
 This command could be dangerous or lead to repository corruption when used improperly.
 
 Running this command is not needed for using Kopia. Instead, most users should rely on periodic repository maintenance. See https://kopia.io/docs/advanced/maintenance/ for more information.
 To run this command despite the warning, set KOPIA_ADVANCED_COMMANDS=enabled
 
 `)
-		os.Exit(1)
+
+		c.osExit(1)
 	}
+}
+
+func init() {
+	kingpin.EnableFileExpansion = false
 }

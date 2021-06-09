@@ -21,6 +21,8 @@ import (
 )
 
 type commandRepositorySyncTo struct {
+	nextSyncOutputTime *timetrack.Throttle
+
 	repositorySyncUpdate               bool
 	repositorySyncDelete               bool
 	repositorySyncDryRun               bool
@@ -30,8 +32,9 @@ type commandRepositorySyncTo struct {
 
 	lastSyncProgress       string
 	syncProgressMutex      sync.Mutex
-	nextSyncOutputTime     timetrack.Throttle
 	setTimeUnsupportedOnce sync.Once
+
+	out textOutput
 }
 
 func (c *commandRepositorySyncTo) setup(svc advancedAppServices, parent commandParent) {
@@ -43,13 +46,18 @@ func (c *commandRepositorySyncTo) setup(svc advancedAppServices, parent commandP
 	cmd.Flag("must-exist", "Fail if destination does not have repository format blob.").BoolVar(&c.repositorySyncDestinationMustExist)
 	cmd.Flag("times", "Synchronize blob times if supported.").BoolVar(&c.repositorySyncTimes)
 
+	c.out.setup(svc)
+
+	// needs to be 64-bit aligned on ARM
+	c.nextSyncOutputTime = new(timetrack.Throttle)
+
 	for _, prov := range storageProviders {
 		// Set up 'sync-to' subcommand
 		f := prov.newFlags()
 		cc := cmd.Command(prov.name, "Synchronize repository data to another repository in "+prov.description)
-		f.setup(cc)
+		f.setup(svc, cc)
 		cc.Action(func(_ *kingpin.ParseContext) error {
-			ctx := rootContext()
+			ctx := svc.rootContext()
 			st, err := f.connect(ctx, false)
 			if err != nil {
 				return errors.Wrap(err, "can't connect to storage")
@@ -200,14 +208,14 @@ func (c *commandRepositorySyncTo) outputSyncProgress(s string) {
 	}
 
 	if c.nextSyncOutputTime.ShouldOutput(syncProgressInterval) {
-		printStderr("\r%v", s)
+		c.out.printStderr("\r%v", s)
 	}
 
 	c.lastSyncProgress = s
 }
 
 func (c *commandRepositorySyncTo) finishSyncProcess() {
-	printStderr("\r%v\n", c.lastSyncProgress)
+	c.out.printStderr("\r%v\n", c.lastSyncProgress)
 }
 
 func (c *commandRepositorySyncTo) runSyncBlobs(ctx context.Context, src blob.Reader, dst blob.Storage, blobsToCopy, blobsToDelete []blob.Metadata, totalBytes int64) error {
@@ -336,7 +344,7 @@ func (c *commandRepositorySyncTo) ensureRepositoriesHaveSameFormatBlob(ctx conte
 				return errors.Errorf("destination repository does not have a format blob")
 			}
 
-			return dst.PutBlob(ctx, repo.FormatBlobID, gather.FromSlice(srcData))
+			return errors.Wrap(dst.PutBlob(ctx, repo.FormatBlobID, gather.FromSlice(srcData)), "error saving format blob")
 		}
 
 		return errors.Wrap(err, "error reading destination repository format blob")

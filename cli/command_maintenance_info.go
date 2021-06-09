@@ -7,18 +7,21 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/units"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/maintenance"
 )
 
 type commandMaintenanceInfo struct {
-	jo jsonOutput
+	jo  jsonOutput
+	out textOutput
 }
 
 func (c *commandMaintenanceInfo) setup(svc appServices, parent commandParent) {
 	cmd := parent.Command("info", "Display maintenance information").Alias("status")
-	c.jo.setup(cmd)
+	c.jo.setup(svc, cmd)
 	cmd.Action(svc.directRepositoryReadAction(c.run))
+	c.out.setup(svc)
 }
 
 func (c *commandMaintenanceInfo) run(ctx context.Context, rep repo.DirectRepository) error {
@@ -33,21 +36,28 @@ func (c *commandMaintenanceInfo) run(ctx context.Context, rep repo.DirectReposit
 	}
 
 	if c.jo.jsonOutput {
-		printStdout("%s\n", c.jo.jsonBytes(s))
+		c.out.printStdout("%s\n", c.jo.jsonBytes(s))
 		return nil
 	}
 
-	printStdout("Owner: %v\n", p.Owner)
-	printStdout("Quick Cycle:\n")
-	displayCycleInfo(&p.QuickCycle, s.NextQuickMaintenanceTime, rep)
+	c.out.printStdout("Owner: %v\n", p.Owner)
+	c.out.printStdout("Quick Cycle:\n")
+	c.displayCycleInfo(&p.QuickCycle, s.NextQuickMaintenanceTime, rep)
 
-	printStdout("Full Cycle:\n")
-	displayCycleInfo(&p.FullCycle, s.NextFullMaintenanceTime, rep)
+	c.out.printStdout("Full Cycle:\n")
+	c.displayCycleInfo(&p.FullCycle, s.NextFullMaintenanceTime, rep)
 
-	printStdout("Recent Maintenance Runs:\n")
+	cl := p.LogRetention.OrDefault()
+
+	c.out.printStdout("Log Retention:\n")
+	c.out.printStdout("  max count:       %v\n", cl.MaxCount)
+	c.out.printStdout("  max age of logs: %v\n", cl.MaxAge)
+	c.out.printStdout("  max total size:  %v\n", units.BytesStringBase2(cl.MaxTotalSize))
+
+	c.out.printStdout("Recent Maintenance Runs:\n")
 
 	for run, timings := range s.Runs {
-		printStdout("  %v:\n", run)
+		c.out.printStdout("  %v:\n", run)
 
 		for _, t := range timings {
 			var errInfo string
@@ -57,7 +67,7 @@ func (c *commandMaintenanceInfo) run(ctx context.Context, rep repo.DirectReposit
 				errInfo = "ERROR: " + t.Error
 			}
 
-			printStdout(
+			c.out.printStdout(
 				"    %v (%v) %v\n",
 				formatTimestamp(t.Start),
 				t.End.Sub(t.Start).Truncate(time.Second),
@@ -68,16 +78,16 @@ func (c *commandMaintenanceInfo) run(ctx context.Context, rep repo.DirectReposit
 	return nil
 }
 
-func displayCycleInfo(c *maintenance.CycleParams, t time.Time, rep repo.DirectRepository) {
-	printStdout("  scheduled: %v\n", c.Enabled)
+func (c *commandMaintenanceInfo) displayCycleInfo(cp *maintenance.CycleParams, t time.Time, rep repo.DirectRepository) {
+	c.out.printStdout("  scheduled: %v\n", cp.Enabled)
 
-	if c.Enabled {
-		printStdout("  interval: %v\n", c.Interval)
+	if cp.Enabled {
+		c.out.printStdout("  interval: %v\n", cp.Interval)
 
 		if rep.Time().Before(t) {
-			printStdout("  next run: %v (in %v)\n", formatTimestamp(t), clock.Until(t).Truncate(time.Second))
+			c.out.printStdout("  next run: %v (in %v)\n", formatTimestamp(t), clock.Until(t).Truncate(time.Second))
 		} else {
-			printStdout("  next run: now\n")
+			c.out.printStdout("  next run: now\n")
 		}
 	}
 }

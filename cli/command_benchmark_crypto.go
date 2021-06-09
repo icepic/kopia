@@ -18,6 +18,8 @@ type commandBenchmarkCrypto struct {
 	repeat               int
 	deprecatedAlgorithms bool
 	optionPrint          bool
+
+	out textOutput
 }
 
 func (c *commandBenchmarkCrypto) setup(svc appServices, parent commandParent) {
@@ -27,6 +29,7 @@ func (c *commandBenchmarkCrypto) setup(svc appServices, parent commandParent) {
 	cmd.Flag("deprecated", "Include deprecated algorithms").BoolVar(&c.deprecatedAlgorithms)
 	cmd.Flag("print-options", "Print out options usable for repository creation").BoolVar(&c.optionPrint)
 	cmd.Action(svc.noRepositoryAction(c.run))
+	c.out.setup(svc)
 }
 
 func (c *commandBenchmarkCrypto) run(ctx context.Context) error {
@@ -42,16 +45,15 @@ func (c *commandBenchmarkCrypto) run(ctx context.Context) error {
 
 	const (
 		maxEncryptionOverhead = 1024
-		maxHashSize           = 64
 	)
 
-	var hashOutput [maxHashSize]byte
+	var hashOutput [hashing.MaxHashSize]byte
 
 	encryptOutput := make([]byte, len(data)+maxEncryptionOverhead)
 
 	for _, ha := range hashing.SupportedAlgorithms() {
 		for _, ea := range encryption.SupportedAlgorithms(c.deprecatedAlgorithms) {
-			h, e, err := content.CreateHashAndEncryptor(&content.FormattingOptions{
+			cr, err := content.CreateCrypter(&content.FormattingOptions{
 				Encryption: ea,
 				Hash:       ha,
 				MasterKey:  make([]byte, 32),
@@ -68,8 +70,8 @@ func (c *commandBenchmarkCrypto) run(ctx context.Context) error {
 			hashCount := c.repeat
 
 			for i := 0; i < hashCount; i++ {
-				contentID := h(hashOutput[:0], data)
-				if _, encerr := e.Encrypt(encryptOutput[:0], data, contentID); encerr != nil {
+				contentID := cr.HashFunction(hashOutput[:0], data)
+				if _, encerr := cr.Encryptor.Encrypt(encryptOutput[:0], data, contentID); encerr != nil {
 					log(ctx).Errorf("encryption failed: %v", encerr)
 					break
 				}
@@ -84,21 +86,21 @@ func (c *commandBenchmarkCrypto) run(ctx context.Context) error {
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].throughput > results[j].throughput
 	})
-	printStdout("     %-20v %-20v %v\n", "Hash", "Encryption", "Throughput")
-	printStdout("-----------------------------------------------------------------\n")
+	c.out.printStdout("     %-20v %-20v %v\n", "Hash", "Encryption", "Throughput")
+	c.out.printStdout("-----------------------------------------------------------------\n")
 
 	for ndx, r := range results {
-		printStdout("%3d. %-20v %-20v %v / second", ndx, r.hash, r.encryption, units.BytesStringBase2(int64(r.throughput)))
+		c.out.printStdout("%3d. %-20v %-20v %v / second", ndx, r.hash, r.encryption, units.BytesStringBase2(int64(r.throughput)))
 
 		if c.optionPrint {
-			printStdout(",   --block-hash=%s --encryption=%s", r.hash, r.encryption)
+			c.out.printStdout(",   --block-hash=%s --encryption=%s", r.hash, r.encryption)
 		}
 
-		printStdout("\n")
+		c.out.printStdout("\n")
 	}
 
-	printStdout("-----------------------------------------------------------------\n")
-	printStdout("Fastest option for this machine is: --block-hash=%s --encryption=%s\n", results[0].hash, results[0].encryption)
+	c.out.printStdout("-----------------------------------------------------------------\n")
+	c.out.printStdout("Fastest option for this machine is: --block-hash=%s --encryption=%s\n", results[0].hash, results[0].encryption)
 
 	return nil
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"os"
 
 	"github.com/pkg/errors"
 
@@ -17,6 +16,8 @@ import (
 type commandBlobShow struct {
 	blobShowDecrypt bool
 	blobShowIDs     []string
+
+	out textOutput
 }
 
 func (c *commandBlobShow) setup(svc appServices, parent commandParent) {
@@ -24,11 +25,13 @@ func (c *commandBlobShow) setup(svc appServices, parent commandParent) {
 	cmd.Flag("decrypt", "Decrypt blob if possible").BoolVar(&c.blobShowDecrypt)
 	cmd.Arg("blobID", "Blob IDs").Required().StringsVar(&c.blobShowIDs)
 	cmd.Action(svc.directRepositoryReadAction(c.run))
+
+	c.out.setup(svc)
 }
 
 func (c *commandBlobShow) run(ctx context.Context, rep repo.DirectRepository) error {
 	for _, blobID := range c.blobShowIDs {
-		if err := c.maybeDecryptBlob(ctx, os.Stdout, rep, blob.ID(blobID)); err != nil {
+		if err := c.maybeDecryptBlob(ctx, c.out.stdout(), rep, blob.ID(blobID)); err != nil {
 			return errors.Wrap(err, "error presenting blob")
 		}
 	}
@@ -42,8 +45,10 @@ func (c *commandBlobShow) maybeDecryptBlob(ctx context.Context, w io.Writer, rep
 		err error
 	)
 
+	d, err = rep.BlobReader().GetBlob(ctx, blobID, 0, -1)
+
 	if c.blobShowDecrypt && canDecryptBlob(blobID) {
-		d, err = rep.IndexBlobReader().DecryptBlob(ctx, blobID)
+		d, err = rep.Crypter().DecryptBLOB(d, blobID)
 
 		if isJSONBlob(blobID) && err == nil {
 			var b bytes.Buffer
@@ -54,8 +59,6 @@ func (c *commandBlobShow) maybeDecryptBlob(ctx context.Context, w io.Writer, rep
 
 			d = b.Bytes()
 		}
-	} else {
-		d, err = rep.BlobReader().GetBlob(ctx, blobID, 0, -1)
 	}
 
 	if err != nil {
@@ -71,7 +74,7 @@ func (c *commandBlobShow) maybeDecryptBlob(ctx context.Context, w io.Writer, rep
 
 func canDecryptBlob(b blob.ID) bool {
 	switch b[0] {
-	case 'n', 'm', 'l':
+	case '_', 'n', 'm', 'l':
 		return true
 	default:
 		return false

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,19 +18,11 @@ import (
 	"github.com/kopia/kopia/repo"
 )
 
-func deprecatedFlag(help string) func(_ *kingpin.ParseContext) error {
+func deprecatedFlag(w io.Writer, help string) func(_ *kingpin.ParseContext) error {
 	return func(_ *kingpin.ParseContext) error {
-		printStderr("DEPRECATED: %v\n", help)
+		fmt.Fprintf(w, "DEPRECATED: %v\n", help)
 		return nil
 	}
-}
-
-func printStderr(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, msg, args...)
-}
-
-func printStdout(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stdout, msg, args...)
 }
 
 func onCtrlC(f func()) {
@@ -73,6 +66,8 @@ func (c *App) optionsFromFlags(ctx context.Context) *repo.Options {
 		opts.TraceStorage = log(ctx).Debugf
 	}
 
+	opts.DisableInternalLog = c.disableInternalLog
+
 	return &opts
 }
 
@@ -94,6 +89,7 @@ func resolveSymlink(path string) (string, error) {
 		return path, nil
 	}
 
+	// nolint:wrapcheck
 	return filepath.EvalSymlinks(path)
 }
 

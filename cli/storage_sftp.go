@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io/ioutil"
+	"path/filepath"
 
 	"github.com/alecthomas/kingpin"
 	"github.com/pkg/errors"
@@ -17,7 +18,7 @@ type storageSFTPFlags struct {
 	embedCredentials bool
 }
 
-func (c *storageSFTPFlags) setup(cmd *kingpin.CmdClause) {
+func (c *storageSFTPFlags) setup(_ storageProviderServices, cmd *kingpin.CmdClause) {
 	cmd.Flag("path", "Path to the repository in the SFTP/SSH server").Required().StringVar(&c.options.Path)
 	cmd.Flag("host", "SFTP/SSH server hostname").Required().StringVar(&c.options.Host)
 	cmd.Flag("port", "SFTP/SSH server port").Default("22").IntVar(&c.options.Port)
@@ -35,7 +36,7 @@ func (c *storageSFTPFlags) setup(cmd *kingpin.CmdClause) {
 	cmd.Flag("flat", "Use flat directory structure").BoolVar(&c.connectFlat)
 }
 
-func (c *storageSFTPFlags) connect(ctx context.Context, isNew bool) (blob.Storage, error) {
+func (c *storageSFTPFlags) getOptions() (*sftp.Options, error) {
 	sftpo := c.options
 
 	// nolint:nestif
@@ -62,8 +63,32 @@ func (c *storageSFTPFlags) connect(ctx context.Context, isNew bool) (blob.Storag
 			}
 		}
 
-		if sftpo.KeyData == "" && sftpo.Keyfile == "" {
-			return nil, errors.Errorf("must provide either key file or key data")
+		switch {
+		case sftpo.KeyData != "": // ok
+
+		case sftpo.Keyfile != "":
+			a, err := filepath.Abs(sftpo.Keyfile)
+			if err != nil {
+				return nil, errors.Wrap(err, "error getting absolute path")
+			}
+
+			sftpo.Keyfile = a
+		default:
+			return nil, errors.Errorf("must provide either --keyfile or --key-data")
+		}
+
+		switch {
+		case sftpo.KnownHostsData != "": // ok
+
+		case sftpo.KnownHostsFile != "":
+			a, err := filepath.Abs(sftpo.KnownHostsFile)
+			if err != nil {
+				return nil, errors.Wrap(err, "error getting absolute path")
+			}
+
+			sftpo.KnownHostsFile = a
+		default:
+			return nil, errors.Errorf("must provide either --known-hosts or --known-hosts-data")
 		}
 	}
 
@@ -71,5 +96,15 @@ func (c *storageSFTPFlags) connect(ctx context.Context, isNew bool) (blob.Storag
 		sftpo.DirectoryShards = []int{}
 	}
 
-	return sftp.New(ctx, &sftpo)
+	return &sftpo, nil
+}
+
+func (c *storageSFTPFlags) connect(ctx context.Context, isNew bool) (blob.Storage, error) {
+	opt, err := c.getOptions()
+	if err != nil {
+		return nil, err
+	}
+
+	// nolint:wrapcheck
+	return sftp.New(ctx, opt)
 }

@@ -21,6 +21,9 @@ type commandSnapshotEstimate struct {
 	snapshotEstimateShowFiles   bool
 	snapshotEstimateQuiet       bool
 	snapshotEstimateUploadSpeed float64
+	maxExamplesPerBucket        int
+
+	out textOutput
 }
 
 func (c *commandSnapshotEstimate) setup(svc appServices, parent commandParent) {
@@ -29,7 +32,9 @@ func (c *commandSnapshotEstimate) setup(svc appServices, parent commandParent) {
 	cmd.Flag("show-files", "Show files").BoolVar(&c.snapshotEstimateShowFiles)
 	cmd.Flag("quiet", "Do not display scanning progress").Short('q').BoolVar(&c.snapshotEstimateQuiet)
 	cmd.Flag("upload-speed", "Upload speed to use for estimation").Default("10").PlaceHolder("mbit/s").Float64Var(&c.snapshotEstimateUploadSpeed)
+	cmd.Flag("max-examples-per-bucket", "Max examples per bucket").Default("10").IntVar(&c.maxExamplesPerBucket)
 	cmd.Action(svc.repositoryReaderAction(c.run))
+	c.out.setup(svc)
 }
 
 type estimateProgress struct {
@@ -92,45 +97,45 @@ func (c *commandSnapshotEstimate) run(ctx context.Context, rep repo.Repository) 
 		return errors.Wrapf(err, "error creating policy tree for %v", sourceInfo)
 	}
 
-	if err := snapshotfs.Estimate(ctx, rep, dir, policyTree, &ep); err != nil {
+	if err := snapshotfs.Estimate(ctx, rep, dir, policyTree, &ep, c.maxExamplesPerBucket); err != nil {
 		return errors.Wrap(err, "error estimating")
 	}
 
-	fmt.Printf("Snapshot includes %v files, total size %v\n", ep.stats.TotalFileCount, units.BytesStringBase10(ep.stats.TotalFileSize))
-	showBuckets(ep.included, c.snapshotEstimateShowFiles)
-	fmt.Println()
+	c.out.printStdout("Snapshot includes %v file(s), total size %v\n", ep.stats.TotalFileCount, units.BytesStringBase10(ep.stats.TotalFileSize))
+	c.showBuckets(ep.included, c.snapshotEstimateShowFiles)
+	c.out.printStdout("\n")
 
 	if ep.stats.ExcludedFileCount > 0 {
-		fmt.Printf("Snapshot excludes %v files, total size %v\n", ep.stats.ExcludedFileCount, ep.stats.ExcludedTotalFileSize)
-		showBuckets(ep.excluded, true)
+		c.out.printStdout("Snapshot excludes %v file(s), total size %v\n", ep.stats.ExcludedFileCount, units.BytesStringBase10(ep.stats.ExcludedTotalFileSize))
+		c.showBuckets(ep.excluded, true)
 	} else {
-		fmt.Printf("Snapshots excludes no files.\n")
+		c.out.printStdout("Snapshot excludes no files.\n")
 	}
 
 	if ep.stats.ExcludedDirCount > 0 {
-		fmt.Printf("Snapshots excludes %v directories. Examples:\n", ep.stats.ExcludedDirCount)
+		c.out.printStdout("Snapshot excludes %v directories. Examples:\n", ep.stats.ExcludedDirCount)
 
 		for _, ed := range ep.excludedDirs {
-			fmt.Printf(" - %v\n", ed)
+			c.out.printStdout(" - %v\n", ed)
 		}
 	} else {
-		fmt.Printf("Snapshots excludes no directories.\n")
+		c.out.printStdout("Snapshot excludes no directories.\n")
 	}
 
 	if ep.stats.ErrorCount > 0 {
-		fmt.Printf("Encountered %v errors.\n", ep.stats.ErrorCount)
+		c.out.printStdout("Encountered %v error(s).\n", ep.stats.ErrorCount)
 	}
 
 	megabits := float64(ep.stats.TotalFileSize) * 8 / 1000000 //nolint:gomnd
 	seconds := megabits / c.snapshotEstimateUploadSpeed
 
-	fmt.Println()
-	fmt.Printf("Estimated upload time: %v at %v Mbit/s\n", time.Duration(seconds)*time.Second, c.snapshotEstimateUploadSpeed)
+	c.out.printStdout("\n")
+	c.out.printStdout("Estimated upload time: %v at %v Mbit/s\n", time.Duration(seconds)*time.Second, c.snapshotEstimateUploadSpeed)
 
 	return nil
 }
 
-func showBuckets(buckets snapshotfs.SampleBuckets, showFiles bool) {
+func (c *commandSnapshotEstimate) showBuckets(buckets snapshotfs.SampleBuckets, showFiles bool) {
 	for i, bucket := range buckets {
 		if bucket.Count == 0 {
 			continue
@@ -147,13 +152,13 @@ func showBuckets(buckets snapshotfs.SampleBuckets, showFiles bool) {
 				units.BytesStringBase10(buckets[i-1].MinSize))
 		}
 
-		fmt.Printf("%18v: %7v files, total size %v\n",
+		c.out.printStdout("%18v: %7v files, total size %v\n",
 			sizeRange,
 			bucket.Count, units.BytesStringBase10(bucket.TotalSize))
 
 		if showFiles {
 			for _, sample := range bucket.Examples {
-				fmt.Printf(" - %v\n", sample)
+				c.out.printStdout(" - %v\n", sample)
 			}
 		}
 	}

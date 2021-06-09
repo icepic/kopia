@@ -18,14 +18,15 @@ import (
 
 // StatusResponse is the response of 'status' HTTP API command.
 type StatusResponse struct {
-	Connected    bool   `json:"connected"`
-	ConfigFile   string `json:"configFile,omitempty"`
-	Hash         string `json:"hash,omitempty"`
-	Encryption   string `json:"encryption,omitempty"`
-	Splitter     string `json:"splitter,omitempty"`
-	MaxPackSize  int    `json:"maxPackSize,omitempty"`
-	Storage      string `json:"storage,omitempty"`
-	APIServerURL string `json:"apiServerURL,omitempty"`
+	Connected                  bool   `json:"connected"`
+	ConfigFile                 string `json:"configFile,omitempty"`
+	Hash                       string `json:"hash,omitempty"`
+	Encryption                 string `json:"encryption,omitempty"`
+	Splitter                   string `json:"splitter,omitempty"`
+	MaxPackSize                int    `json:"maxPackSize,omitempty"`
+	Storage                    string `json:"storage,omitempty"`
+	APIServerURL               string `json:"apiServerURL,omitempty"`
+	SupportsContentCompression bool   `json:"supportsContentCompression"`
 
 	repo.ClientOptions
 }
@@ -216,5 +217,6 @@ type RestoreRequest struct {
 
 // EstimateRequest contains request to estimate the size of the snapshot in a given root.
 type EstimateRequest struct {
-	Root string `json:"root"`
+	Root                 string `json:"root"`
+	MaxExamplesPerBucket int    `json:"maxExamplesPerBucket"`
 }

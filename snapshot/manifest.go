@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strconv"
@@ -54,6 +55,7 @@ func (p Permissions) MarshalJSON() ([]byte, error) {
 
 	s := "0" + strconv.FormatInt(int64(p), 8)
 
+	// nolint:wrapcheck
 	return json.Marshal(&s)
 }
 
@@ -91,6 +93,12 @@ type DirEntry struct {
 // HasDirEntry is implemented by objects that have a DirEntry associated with them.
 type HasDirEntry interface {
 	DirEntry() *DirEntry
+}
+
+// HasDirEntryOrNil is implemented by objects that may have a DirEntry
+// stored in the object's corresponding shallow placeholder file.
+type HasDirEntryOrNil interface {
+	DirEntryOrNil(ctx context.Context) (*DirEntry, error)
 }
 
 // DirManifest represents serialized contents of a directory.

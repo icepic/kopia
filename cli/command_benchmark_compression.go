@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"sort"
 
-	atunits "github.com/alecthomas/units"
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/timetrack"
@@ -15,24 +14,27 @@ import (
 	"github.com/kopia/kopia/repo/compression"
 )
 
+const defaultCompressedDataByMethod = 128 << 20 // 128 MB
+
 type commandBenchmarkCompression struct {
-	blockSize    atunits.Base2Bytes
 	repeat       int
 	dataFile     string
 	bySize       bool
 	verifyStable bool
 	optionPrint  bool
+
+	out textOutput
 }
 
 func (c *commandBenchmarkCompression) setup(svc appServices, parent commandParent) {
 	cmd := parent.Command("compression", "Run compression benchmarks")
-	cmd.Flag("block-size", "Size of a block to compress").Default("1MB").BytesVar(&c.blockSize)
-	cmd.Flag("repeat", "Number of repetitions").Default("100").IntVar(&c.repeat)
-	cmd.Flag("data-file", "Use data from the given file instead of empty").ExistingFileVar(&c.dataFile)
+	cmd.Flag("repeat", "Number of repetitions").Default("0").IntVar(&c.repeat)
+	cmd.Flag("data-file", "Use data from the given file").Required().ExistingFileVar(&c.dataFile)
 	cmd.Flag("by-size", "Sort results by size").BoolVar(&c.bySize)
 	cmd.Flag("verify-stable", "Verify that compression is stable").BoolVar(&c.verifyStable)
 	cmd.Flag("print-options", "Print out options usable for repository creation").BoolVar(&c.optionPrint)
 	cmd.Action(svc.noRepositoryAction(c.run))
+	c.out.setup(svc)
 }
 
 func (c *commandBenchmarkCompression) run(ctx context.Context) error {
@@ -44,29 +46,40 @@ func (c *commandBenchmarkCompression) run(ctx context.Context) error {
 
 	var results []benchResult
 
-	data := make([]byte, c.blockSize)
-
-	if c.dataFile != "" {
-		d, err := ioutil.ReadFile(c.dataFile)
-		if err != nil {
-			return errors.Wrap(err, "error reading compression data file")
-		}
-
-		data = d
+	data, err := ioutil.ReadFile(c.dataFile)
+	if err != nil {
+		return errors.Wrap(err, "error reading compression data file")
 	}
 
+	if len(data) == 0 {
+		return errors.Errorf("empty data file")
+	}
+
+	log(ctx).Infof("Compressing input file %q (%v) using all compression methods.", c.dataFile, units.BytesStringBase2(int64(len(data))))
+
+	repeatCount := c.repeat
+
+	if repeatCount == 0 {
+		repeatCount = defaultCompressedDataByMethod / len(data)
+
+		if repeatCount == 0 {
+			repeatCount = 1
+		}
+	}
+
+	log(ctx).Infof("Repeating %v times per compression method (total %v). Override with --repeat=N.", repeatCount, units.BytesStringBase2(int64(repeatCount*len(data))))
+
 	for name, comp := range compression.ByName {
-		log(ctx).Infof("Benchmarking compressor '%v' (%v x %v bytes)", name, c.repeat, len(data))
+		log(ctx).Infof("Benchmarking compressor '%v'...", name)
 
 		tt := timetrack.Start()
+		cnt := repeatCount
 
-		var compressedSize int64
-
-		var lastHash uint64
-
-		cnt := c.repeat
-
-		var compressed bytes.Buffer
+		var (
+			compressedSize int64
+			lastHash       uint64
+			compressed     bytes.Buffer
+		)
 
 		for i := 0; i < cnt; i++ {
 			compressed.Reset()
@@ -105,17 +118,17 @@ func (c *commandBenchmarkCompression) run(ctx context.Context) error {
 		})
 	}
 
-	printStdout("     %-30v %-15v %v\n", "Compression", "Compressed Size", "Throughput")
-	printStdout("-----------------------------------------------------------------\n")
+	c.out.printStdout("     %-30v %-15v %v\n", "Compression", "Compressed Size", "Throughput")
+	c.out.printStdout("-----------------------------------------------------------------\n")
 
 	for ndx, r := range results {
-		printStdout("%3d. %-30v %-15v %v / second", ndx, r.compression, r.compressedSize, units.BytesStringBase2(int64(r.throughput)))
+		c.out.printStdout("%3d. %-30v %-15v %v / second", ndx, r.compression, r.compressedSize, units.BytesStringBase2(int64(r.throughput)))
 
 		if c.optionPrint {
-			printStdout(", --compression=%s", r.compression)
+			c.out.printStdout(", --compression=%s", r.compression)
 		}
 
-		printStdout("\n")
+		c.out.printStdout("\n")
 	}
 
 	return nil
@@ -123,7 +136,7 @@ func (c *commandBenchmarkCompression) run(ctx context.Context) error {
 
 func hashOf(b []byte) uint64 {
 	h := fnv.New64a()
-	h.Write(b) //nolint:errcheck
+	h.Write(b)
 
 	return h.Sum64()
 }

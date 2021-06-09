@@ -14,6 +14,7 @@ import (
 	"github.com/kopia/kopia/internal/cache"
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/remoterepoapi"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/hashing"
 	"github.com/kopia/kopia/repo/manifest"
@@ -30,12 +31,13 @@ type APIServerInfo struct {
 // remoteRepository is an implementation of Repository that connects to an instance of
 // API server hosted by `kopia server`, instead of directly manipulating files in the BLOB storage.
 type apiServerRepository struct {
-	cli          *apiclient.KopiaAPIClient
-	h            hashing.HashFunc
-	objectFormat object.Format
-	cliOpts      ClientOptions
-	omgr         *object.Manager
-	wso          WriteSessionOptions
+	cli                              *apiclient.KopiaAPIClient
+	h                                hashing.HashFunc
+	objectFormat                     object.Format
+	serverSupportsContentCompression bool
+	cliOpts                          ClientOptions
+	omgr                             *object.Manager
+	wso                              WriteSessionOptions
 
 	isSharedReadOnlySession bool
 	contentCache            *cache.PersistentCache
@@ -58,6 +60,7 @@ func (r *apiServerRepository) ClientOptions() ClientOptions {
 }
 
 func (r *apiServerRepository) OpenObject(ctx context.Context, id object.ID) (object.Reader, error) {
+	// nolint:wrapcheck
 	return object.Open(ctx, r, id)
 }
 
@@ -66,6 +69,7 @@ func (r *apiServerRepository) NewObjectWriter(ctx context.Context, opt object.Wr
 }
 
 func (r *apiServerRepository) VerifyObject(ctx context.Context, id object.ID) ([]content.ID, error) {
+	// nolint:wrapcheck
 	return object.VerifyObject(ctx, r, id)
 }
 
@@ -76,6 +80,7 @@ func (r *apiServerRepository) GetManifest(ctx context.Context, id manifest.ID, d
 		return nil, errors.Wrap(err, "GetManifest")
 	}
 
+	// nolint:wrapcheck
 	return mm.Metadata, json.Unmarshal(mm.Payload, data)
 }
 
@@ -133,7 +138,11 @@ func (r *apiServerRepository) Flush(ctx context.Context) error {
 	return errors.Wrap(r.cli.Post(ctx, "flush", nil, nil), "Flush")
 }
 
-func (r *apiServerRepository) NewWriter(ctx context.Context, opt WriteSessionOptions) (RepositoryWriter, error) {
+func (r *apiServerRepository) SupportsContentCompression() bool {
+	return r.serverSupportsContentCompression
+}
+
+func (r *apiServerRepository) NewWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, RepositoryWriter, error) {
 	// apiServerRepository is stateless except object manager.
 	r2 := *r
 	w := &r2
@@ -141,14 +150,14 @@ func (r *apiServerRepository) NewWriter(ctx context.Context, opt WriteSessionOpt
 	// create object manager using a remote repo as contentManager implementation.
 	omgr, err := object.NewObjectManager(ctx, w, r.objectFormat)
 	if err != nil {
-		return nil, errors.Wrap(err, "error initializing object manager")
+		return nil, nil, errors.Wrap(err, "error initializing object manager")
 	}
 
 	w.omgr = omgr
 	w.wso = opt
 	w.isSharedReadOnlySession = false
 
-	return w, nil
+	return ctx, w, nil
 }
 
 func (r *apiServerRepository) ContentInfo(ctx context.Context, contentID content.ID) (content.Info, error) {
@@ -162,6 +171,7 @@ func (r *apiServerRepository) ContentInfo(ctx context.Context, contentID content
 }
 
 func (r *apiServerRepository) GetContent(ctx context.Context, contentID content.ID) ([]byte, error) {
+	// nolint:wrapcheck
 	return r.contentCache.GetOrLoad(ctx, string(contentID), func() ([]byte, error) {
 		var result []byte
 
@@ -173,7 +183,7 @@ func (r *apiServerRepository) GetContent(ctx context.Context, contentID content.
 	})
 }
 
-func (r *apiServerRepository) WriteContent(ctx context.Context, data []byte, prefix content.ID) (content.ID, error) {
+func (r *apiServerRepository) WriteContent(ctx context.Context, data []byte, prefix content.ID, comp compression.HeaderID) (content.ID, error) {
 	if err := content.ValidatePrefix(prefix); err != nil {
 		return "", errors.Wrap(err, "invalid prefix")
 	}
@@ -190,7 +200,12 @@ func (r *apiServerRepository) WriteContent(ctx context.Context, data []byte, pre
 
 	r.wso.OnUpload(int64(len(data)))
 
-	if err := r.cli.Put(ctx, "contents/"+string(contentID), data, nil); err != nil {
+	maybeCompression := ""
+	if comp != content.NoCompression {
+		maybeCompression = fmt.Sprintf("?compression=%x", comp)
+	}
+
+	if err := r.cli.Put(ctx, "contents/"+string(contentID)+maybeCompression, data, nil); err != nil {
 		return "", errors.Wrapf(err, "error writing content %v", contentID)
 	}
 
@@ -262,6 +277,7 @@ func openRestAPIRepository(ctx context.Context, si *APIServerInfo, cliOpts Clien
 
 	rr.h = hf
 	rr.objectFormat = p.Format
+	rr.serverSupportsContentCompression = p.SupportsContentCompression
 
 	// create object manager using rr as contentManager implementation.
 	omgr, err := object.NewObjectManager(ctx, rr, rr.objectFormat)
@@ -289,5 +305,5 @@ func ConnectAPIServer(ctx context.Context, configFile string, si *APIServerInfo,
 		return errors.Wrap(err, "unable to write config file")
 	}
 
-	return verifyConnect(ctx, configFile, password, opt.PersistCredentials)
+	return verifyConnect(ctx, configFile, password)
 }

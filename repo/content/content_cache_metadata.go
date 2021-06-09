@@ -16,7 +16,7 @@ import (
 
 const (
 	metadataCacheSyncParallelism = 16
-	metadataCacheMutexShards     = 16
+	metadataCacheMutexShards     = 256
 )
 
 type contentCacheForMetadata struct {
@@ -29,9 +29,6 @@ type contentCacheForMetadata struct {
 // sync synchronizes metadata cache with all blobs found in the storage.
 func (c *contentCacheForMetadata) sync(ctx context.Context) error {
 	sem := make(chan struct{}, metadataCacheSyncParallelism)
-
-	log(ctx).Debugf("synchronizing metadata cache...")
-	defer log(ctx).Debugf("finished synchronizing metadata cache.")
 
 	var eg errgroup.Group
 
@@ -53,7 +50,7 @@ func (c *contentCacheForMetadata) sync(ctx context.Context) error {
 		return errors.Wrap(err, "error listing blobs")
 	}
 
-	return eg.Wait()
+	return errors.Wrap(eg.Wait(), "error synchronizing metadata cache")
 }
 
 func (c *contentCacheForMetadata) mutexForBlob(blobID blob.ID) *sync.Mutex {
@@ -66,13 +63,14 @@ func (c *contentCacheForMetadata) mutexForBlob(blobID blob.ID) *sync.Mutex {
 }
 
 func (c *contentCacheForMetadata) getContent(ctx context.Context, cacheKey cacheKey, blobID blob.ID, offset, length int64) ([]byte, error) {
-	m := c.mutexForBlob(blobID)
-	m.Lock()
-	defer m.Unlock()
-
+	// try getting from cache first
 	if v := c.pc.Get(ctx, string(blobID), offset, length); v != nil {
 		return v, nil
 	}
+
+	m := c.mutexForBlob(blobID)
+	m.Lock()
+	defer m.Unlock()
 
 	// read the entire blob
 	blobData, err := c.st.GetBlob(ctx, blobID, 0, -1)

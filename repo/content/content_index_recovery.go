@@ -20,13 +20,16 @@ func (bm *WriteManager) RecoverIndexFromPackBlob(ctx context.Context, packFile b
 		return nil, err
 	}
 
-	ndx, err := openPackIndex(bytes.NewReader(localIndexBytes), uint32(bm.encryptor.Overhead()))
+	ndx, err := openPackIndex(bytes.NewReader(localIndexBytes), uint32(bm.crypter.Encryptor.Overhead()))
 	if err != nil {
 		return nil, errors.Errorf("unable to open index in file %v", packFile)
 	}
 	defer ndx.Close() //nolint:errcheck
 
 	var recovered []Info
+
+	bm.lock()
+	defer bm.unlock()
 
 	err = ndx.Iterate(AllIDs, func(i Info) error {
 		recovered = append(recovered, i)
@@ -157,9 +160,9 @@ func decodePostamble(payload []byte) *packContentPostamble {
 	}
 }
 
-func buildLocalIndex(pending packIndexBuilder) ([]byte, error) {
+func (sm *SharedManager) buildLocalIndex(pending packIndexBuilder) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := pending.Build(&buf); err != nil {
+	if err := pending.Build(&buf, sm.indexVersion); err != nil {
 		return nil, errors.Wrap(err, "unable to build local index")
 	}
 
@@ -171,14 +174,14 @@ func (sm *SharedManager) writePackFileIndexRecoveryData(buf *gather.WriteBuffer,
 	// build, encrypt and append local index
 	localIndexOffset := buf.Length()
 
-	localIndex, err := buildLocalIndex(pending)
+	localIndex, err := sm.buildLocalIndex(pending)
 	if err != nil {
 		return err
 	}
 
 	localIndexIV := sm.hashData(nil, localIndex)
 
-	encryptedLocalIndex, err := sm.encryptor.Encrypt(nil, localIndex, localIndexIV)
+	encryptedLocalIndex, err := sm.crypter.Encryptor.Encrypt(nil, localIndex, localIndexIV)
 	if err != nil {
 		return errors.Wrap(err, "encryption error")
 	}

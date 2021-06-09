@@ -2,6 +2,8 @@ package repo
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -9,6 +11,7 @@ import (
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/content"
+	"github.com/kopia/kopia/repo/logging"
 	"github.com/kopia/kopia/repo/manifest"
 	"github.com/kopia/kopia/repo/object"
 )
@@ -24,7 +27,7 @@ type Repository interface {
 	Time() time.Time
 	ClientOptions() ClientOptions
 
-	NewWriter(ctx context.Context, opt WriteSessionOptions) (RepositoryWriter, error)
+	NewWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, RepositoryWriter, error)
 
 	UpdateDescription(d string)
 
@@ -51,8 +54,10 @@ type DirectRepository interface {
 	BlobReader() blob.Reader
 	ContentReader() content.Reader
 	IndexBlobReader() content.IndexBlobReader
+	Crypter() *content.Crypter
 
-	NewDirectWriter(ctx context.Context, opt WriteSessionOptions) (DirectRepositoryWriter, error)
+	NewDirectWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, DirectRepositoryWriter, error)
+	InternalLogger() logging.Logger
 
 	// misc
 	UniqueID() []byte
@@ -79,6 +84,7 @@ type directRepositoryParameters struct {
 	timeNow        func() time.Time
 	formatBlob     *formatBlob
 	masterKey      []byte
+	nextWriterID   *int32
 }
 
 // directRepository is an implementation of repository that directly manipulates underlying storage.
@@ -119,6 +125,11 @@ func (r *directRepository) ConfigFilename() string {
 	return r.configFile
 }
 
+// Crypter returns a Crypter object.
+func (r *directRepository) Crypter() *content.Crypter {
+	return r.sm.Crypter()
+}
+
 // NewObjectWriter creates an object writer.
 func (r *directRepository) NewObjectWriter(ctx context.Context, opt object.WriterOptions) object.Writer {
 	return r.omgr.NewWriter(ctx, opt)
@@ -126,36 +137,43 @@ func (r *directRepository) NewObjectWriter(ctx context.Context, opt object.Write
 
 // OpenObject opens the reader for a given object, returns object.ErrNotFound.
 func (r *directRepository) OpenObject(ctx context.Context, id object.ID) (object.Reader, error) {
+	// nolint:wrapcheck
 	return object.Open(ctx, r.cmgr, id)
 }
 
 // VerifyObject verifies that the given object is stored properly in a repository and returns backing content IDs.
 func (r *directRepository) VerifyObject(ctx context.Context, id object.ID) ([]content.ID, error) {
+	// nolint:wrapcheck
 	return object.VerifyObject(ctx, r.cmgr, id)
 }
 
 // GetManifest returns the given manifest data and metadata.
 func (r *directRepository) GetManifest(ctx context.Context, id manifest.ID, data interface{}) (*manifest.EntryMetadata, error) {
+	// nolint:wrapcheck
 	return r.mmgr.Get(ctx, id, data)
 }
 
 // PutManifest saves the given manifest payload with a set of labels.
 func (r *directRepository) PutManifest(ctx context.Context, labels map[string]string, payload interface{}) (manifest.ID, error) {
+	// nolint:wrapcheck
 	return r.mmgr.Put(ctx, labels, payload)
 }
 
 // FindManifests returns metadata for manifests matching given set of labels.
 func (r *directRepository) FindManifests(ctx context.Context, labels map[string]string) ([]*manifest.EntryMetadata, error) {
+	// nolint:wrapcheck
 	return r.mmgr.Find(ctx, labels)
 }
 
 // DeleteManifest deletes the manifest with a given ID.
 func (r *directRepository) DeleteManifest(ctx context.Context, id manifest.ID) error {
+	// nolint:wrapcheck
 	return r.mmgr.Delete(ctx, id)
 }
 
 // ListActiveSessions returns the map of active sessions.
 func (r *directRepository) ListActiveSessions(ctx context.Context) (map[content.SessionID]*content.SessionInfo, error) {
+	// nolint:wrapcheck
 	return r.cmgr.ListActiveSessions(ctx)
 }
 
@@ -164,29 +182,36 @@ func (r *directRepository) UpdateDescription(d string) {
 	r.cliOpts.Description = d
 }
 
+// Logger returns the internal logger for the repository.
+func (r *directRepository) InternalLogger() logging.Logger {
+	return r.sm.InternalLogger()
+}
+
 // NewWriter returns new RepositoryWriter session for repository.
-func (r *directRepository) NewWriter(ctx context.Context, opt WriteSessionOptions) (RepositoryWriter, error) {
+func (r *directRepository) NewWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, RepositoryWriter, error) {
 	return r.NewDirectWriter(ctx, opt)
 }
 
 // NewDirectWriter returns new DirectRepositoryWriter session for repository.
-func (r *directRepository) NewDirectWriter(ctx context.Context, opt WriteSessionOptions) (DirectRepositoryWriter, error) {
-	cmgr := content.NewWriteManager(r.sm, content.SessionOptions{
+func (r *directRepository) NewDirectWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, DirectRepositoryWriter, error) {
+	writeManagerID := fmt.Sprintf("[writer-%v:%v] ", atomic.AddInt32(r.nextWriterID, 1), opt.Purpose)
+
+	cmgr := content.NewWriteManager(ctx, r.sm, content.SessionOptions{
 		SessionUser: r.cliOpts.Username,
 		SessionHost: r.cliOpts.Hostname,
 		OnUpload:    opt.OnUpload,
-	})
+	}, writeManagerID)
 
 	mmgr, err := manifest.NewManager(ctx, cmgr, manifest.ManagerOptions{
 		TimeNow: r.timeNow,
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating manifest manager")
+		return nil, nil, errors.Wrap(err, "error creating manifest manager")
 	}
 
 	omgr, err := object.NewObjectManager(ctx, cmgr, r.omgr.Format)
 	if err != nil {
-		return nil, errors.Wrap(err, "error creating object manager")
+		return nil, nil, errors.Wrap(err, "error creating object manager")
 	}
 
 	w := &directRepository{
@@ -199,7 +224,7 @@ func (r *directRepository) NewDirectWriter(ctx context.Context, opt WriteSession
 		closed:                     make(chan struct{}),
 	}
 
-	return w, nil
+	return ctx, w, nil
 }
 
 // Close closes the repository and releases all resources.
@@ -232,7 +257,7 @@ func (r *directRepository) Flush(ctx context.Context) error {
 		return errors.Wrap(err, "error flushing manifests")
 	}
 
-	return r.cmgr.Flush(ctx)
+	return errors.Wrap(r.cmgr.Flush(ctx), "error flushing contents")
 }
 
 // ObjectFormat returns the object format.
@@ -260,14 +285,9 @@ func (r *directRepository) IndexBlobReader() content.IndexBlobReader {
 	return r.cmgr
 }
 
-// Refresh periodically makes external changes visible to repository.
+// Refresh makes external changes visible to repository.
 func (r *directRepository) Refresh(ctx context.Context) error {
-	_, err := r.cmgr.Refresh(ctx)
-	if err != nil {
-		return errors.Wrap(err, "error refreshing content index")
-	}
-
-	return nil
+	return errors.Wrap(r.cmgr.Refresh(ctx), "error refreshing content index")
 }
 
 // RefreshPeriodically periodically refreshes the repository to reflect the changes made by other hosts.
@@ -302,23 +322,23 @@ type WriteSessionOptions struct {
 }
 
 // WriteSession executes the provided callback in a repository writer created for the purpose and flushes writes.
-func WriteSession(ctx context.Context, r Repository, opt WriteSessionOptions, cb func(w RepositoryWriter) error) error {
-	w, err := r.NewWriter(ctx, opt)
+func WriteSession(ctx context.Context, r Repository, opt WriteSessionOptions, cb func(ctx context.Context, w RepositoryWriter) error) error {
+	ctx, w, err := r.NewWriter(ctx, opt)
 	if err != nil {
 		return errors.Wrap(err, "unable to create writer")
 	}
 
-	return handleWriteSessionResult(ctx, w, opt, cb(w))
+	return handleWriteSessionResult(ctx, w, opt, cb(ctx, w))
 }
 
 // DirectWriteSession executes the provided callback in a DirectRepositoryWriter created for the purpose and flushes writes.
-func DirectWriteSession(ctx context.Context, r DirectRepository, opt WriteSessionOptions, cb func(dw DirectRepositoryWriter) error) error {
-	w, err := r.NewDirectWriter(ctx, opt)
+func DirectWriteSession(ctx context.Context, r DirectRepository, opt WriteSessionOptions, cb func(ctx context.Context, dw DirectRepositoryWriter) error) error {
+	ctx, w, err := r.NewDirectWriter(ctx, opt)
 	if err != nil {
 		return errors.Wrap(err, "unable to create direct writer")
 	}
 
-	return handleWriteSessionResult(ctx, w, opt, cb(w))
+	return handleWriteSessionResult(ctx, w, opt, cb(ctx, w))
 }
 
 func handleWriteSessionResult(ctx context.Context, w RepositoryWriter, opt WriteSessionOptions, resultErr error) error {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/kopia/kopia/internal/passwordpersist"
 	"github.com/kopia/kopia/repo"
 )
 
@@ -17,11 +18,13 @@ type commandRepositoryConnectServer struct {
 	connectAPIServerUseGRPCAPI      bool
 
 	svc advancedAppServices
+	out textOutput
 }
 
 func (c *commandRepositoryConnectServer) setup(svc advancedAppServices, parent commandParent, co *connectOptions) {
 	c.co = co
 	c.svc = svc
+	c.out.setup(svc)
 
 	cmd := parent.Command("server", "Connect to a repository API Server.")
 	cmd.Flag("url", "Server URL").Required().StringVar(&c.connectAPIServerURL)
@@ -57,7 +60,9 @@ func (c *commandRepositoryConnectServer) run(ctx context.Context) error {
 		return errors.Wrap(err, "getting password")
 	}
 
-	if err := repo.ConnectAPIServer(ctx, configFile, as, pass, opt); err != nil {
+	if err := passwordpersist.OnSuccess(
+		ctx, repo.ConnectAPIServer(ctx, configFile, as, pass, opt),
+		c.svc.passwordPersistenceStrategy(), configFile, pass); err != nil {
 		return errors.Wrap(err, "error connecting to API server")
 	}
 

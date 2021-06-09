@@ -21,9 +21,11 @@ type commandRepositoryCreate struct {
 	createBlockEncryptionFormat string
 	createSplitter              string
 	createOnly                  bool
+	createIndexVersion          int
 
 	co  connectOptions
 	svc advancedAppServices
+	out textOutput
 }
 
 func (c *commandRepositoryCreate) setup(svc advancedAppServices, parent commandParent) {
@@ -33,9 +35,11 @@ func (c *commandRepositoryCreate) setup(svc advancedAppServices, parent commandP
 	cmd.Flag("encryption", "Content encryption algorithm.").PlaceHolder("ALGO").Default(encryption.DefaultAlgorithm).EnumVar(&c.createBlockEncryptionFormat, encryption.SupportedAlgorithms(false)...)
 	cmd.Flag("object-splitter", "The splitter to use for new objects in the repository").Default(splitter.DefaultAlgorithm).EnumVar(&c.createSplitter, splitter.SupportedAlgorithms()...)
 	cmd.Flag("create-only", "Create repository, but don't connect to it.").Short('c').BoolVar(&c.createOnly)
+	cmd.Flag("index-version", "Force particular index version").Hidden().Envar("KOPIA_CREATE_INDEX_VERSION").IntVar(&c.createIndexVersion)
 
 	c.co.setup(cmd)
 	c.svc = svc
+	c.out.setup(svc)
 
 	for _, prov := range storageProviders {
 		if prov.name == "from-config" {
@@ -45,9 +49,9 @@ func (c *commandRepositoryCreate) setup(svc advancedAppServices, parent commandP
 		// Set up 'create' subcommand
 		f := prov.newFlags()
 		cc := cmd.Command(prov.name, "Create repository in "+prov.description)
-		f.setup(cc)
+		f.setup(svc, cc)
 		cc.Action(func(_ *kingpin.ParseContext) error {
-			ctx := rootContext()
+			ctx := svc.rootContext()
 			st, err := f.connect(ctx, true)
 			if err != nil {
 				return errors.Wrap(err, "can't connect to storage")
@@ -61,8 +65,9 @@ func (c *commandRepositoryCreate) setup(svc advancedAppServices, parent commandP
 func (c *commandRepositoryCreate) newRepositoryOptionsFromFlags() *repo.NewRepositoryOptions {
 	return &repo.NewRepositoryOptions{
 		BlockFormat: content.FormattingOptions{
-			Hash:       c.createBlockHashFormat,
-			Encryption: c.createBlockEncryptionFormat,
+			Hash:         c.createBlockHashFormat,
+			Encryption:   c.createBlockEncryptionFormat,
+			IndexVersion: c.createIndexVersion,
 		},
 
 		ObjectFormat: object.Format{
@@ -75,7 +80,6 @@ func (c *commandRepositoryCreate) ensureEmpty(ctx context.Context, s blob.Storag
 	hasDataError := errors.Errorf("has data")
 
 	err := s.ListBlobs(ctx, "", func(cb blob.Metadata) error {
-		// nolint:wrapcheck
 		return hasDataError
 	})
 
@@ -126,17 +130,18 @@ func (c *commandRepositoryCreate) populateRepository(ctx context.Context, passwo
 	}
 	defer rep.Close(ctx) //nolint:errcheck
 
+	// nolint:wrapcheck
 	return repo.WriteSession(ctx, rep, repo.WriteSessionOptions{
-		Purpose: "populateRepository",
-	}, func(w repo.RepositoryWriter) error {
+		Purpose: "populate repository",
+	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		if err := policy.SetPolicy(ctx, w, policy.GlobalPolicySourceInfo, policy.DefaultPolicy); err != nil {
 			return errors.Wrap(err, "unable to set global policy")
 		}
 
-		printRetentionPolicy(policy.DefaultPolicy, nil)
-		printCompressionPolicy(policy.DefaultPolicy, nil)
+		printRetentionPolicy(&c.out, policy.DefaultPolicy, nil)
+		printCompressionPolicy(&c.out, policy.DefaultPolicy, nil)
 
-		printStderr("\nTo find more information about default policy run 'kopia policy get'.\nTo change the policy use 'kopia policy set' command.\n")
+		c.out.printStderr("\nTo find more information about default policy run 'kopia policy get'.\nTo change the policy use 'kopia policy set' command.\n")
 
 		if err := setDefaultMaintenanceParameters(ctx, w); err != nil {
 			return errors.Wrap(err, "unable to set maintenance parameters")

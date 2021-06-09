@@ -24,11 +24,13 @@ import (
 const oneDay = 24 * time.Hour
 
 func (c *commandServerStart) generateServerCertificate(ctx context.Context) (*x509.Certificate, *rsa.PrivateKey, error) {
-	return tlsutil.GenerateServerCertificate(
+	cert, key, err := tlsutil.GenerateServerCertificate(
 		ctx,
 		c.serverStartTLSGenerateRSAKeySize,
 		time.Duration(c.serverStartTLSGenerateCertValidDays)*oneDay,
 		c.serverStartTLSGenerateCertNames)
+
+	return cert, key, errors.Wrap(err, "error generating server certificate")
 }
 
 func (c *commandServerStart) startServerWithOptionalTLS(ctx context.Context, httpServer *http.Server) error {
@@ -62,7 +64,7 @@ func (c *commandServerStart) maybeGenerateTLS(ctx context.Context) error {
 	}
 
 	fingerprint := sha256.Sum256(cert.Raw)
-	fmt.Fprintf(os.Stderr, "SERVER CERT SHA256: %v\n", hex.EncodeToString(fingerprint[:]))
+	fmt.Fprintf(c.out.stderr(), "SERVER CERT SHA256: %v\n", hex.EncodeToString(fingerprint[:]))
 
 	log(ctx).Infof("writing TLS certificate to %v", c.serverStartTLSCertFile)
 
@@ -87,10 +89,10 @@ func (c *commandServerStart) startServerWithOptionalTLSAndListener(ctx context.C
 	switch {
 	case c.serverStartTLSCertFile != "" && c.serverStartTLSKeyFile != "":
 		// PEM files provided
-		fmt.Fprintf(os.Stderr, "SERVER ADDRESS: https://%v\n", httpServer.Addr)
+		fmt.Fprintf(c.out.stderr(), "SERVER ADDRESS: https://%v\n", httpServer.Addr)
 		c.showServerUIPrompt(ctx)
 
-		return httpServer.ServeTLS(listener, c.serverStartTLSCertFile, c.serverStartTLSKeyFile)
+		return errors.Wrap(httpServer.ServeTLS(listener, c.serverStartTLSCertFile, c.serverStartTLSKeyFile), "error starting TLS server")
 
 	case c.serverStartTLSGenerateCert:
 		// PEM files not provided, generate in-memory TLS cert/key but don't persit.
@@ -110,7 +112,7 @@ func (c *commandServerStart) startServerWithOptionalTLSAndListener(ctx context.C
 		}
 
 		fingerprint := sha256.Sum256(cert.Raw)
-		fmt.Fprintf(os.Stderr, "SERVER CERT SHA256: %v\n", hex.EncodeToString(fingerprint[:]))
+		fmt.Fprintf(c.out.stderr(), "SERVER CERT SHA256: %v\n", hex.EncodeToString(fingerprint[:]))
 
 		if c.serverStartTLSPrintFullServerCert {
 			// dump PEM-encoded server cert, only used by KopiaUI to securely connnect.
@@ -120,23 +122,23 @@ func (c *commandServerStart) startServerWithOptionalTLSAndListener(ctx context.C
 				return errors.Wrap(err, "Failed to write data")
 			}
 
-			fmt.Fprintf(os.Stderr, "SERVER CERTIFICATE: %v\n", base64.StdEncoding.EncodeToString(b.Bytes()))
+			fmt.Fprintf(c.out.stderr(), "SERVER CERTIFICATE: %v\n", base64.StdEncoding.EncodeToString(b.Bytes()))
 		}
 
-		fmt.Fprintf(os.Stderr, "SERVER ADDRESS: https://%v\n", httpServer.Addr)
+		fmt.Fprintf(c.out.stderr(), "SERVER ADDRESS: https://%v\n", httpServer.Addr)
 		c.showServerUIPrompt(ctx)
 
-		return httpServer.ServeTLS(listener, "", "")
+		return errors.Wrap(httpServer.ServeTLS(listener, "", ""), "error starting TLS server")
 
 	default:
 		if !c.serverStartInsecure {
 			return errors.Errorf("TLS not configured. To start server without encryption pass --insecure.")
 		}
 
-		fmt.Fprintf(os.Stderr, "SERVER ADDRESS: http://%v\n", httpServer.Addr)
+		fmt.Fprintf(c.out.stderr(), "SERVER ADDRESS: http://%v\n", httpServer.Addr)
 		c.showServerUIPrompt(ctx)
 
-		return httpServer.Serve(listener)
+		return errors.Wrap(httpServer.Serve(listener), "error starting server")
 	}
 }
 

@@ -24,6 +24,7 @@ type commandSnapshotMigrate struct {
 	migrateParallel          int
 
 	svc advancedAppServices
+	out textOutput
 }
 
 func (c *commandSnapshotMigrate) setup(svc advancedAppServices, parent commandParent) {
@@ -38,6 +39,7 @@ func (c *commandSnapshotMigrate) setup(svc advancedAppServices, parent commandPa
 	cmd.Action(svc.repositoryWriterAction(c.run))
 
 	c.svc = svc
+	c.out.setup(svc)
 }
 
 func (c *commandSnapshotMigrate) run(ctx context.Context, destRepo repo.RepositoryWriter) error {
@@ -121,20 +123,20 @@ func (c *commandSnapshotMigrate) run(ctx context.Context, destRepo repo.Reposito
 
 	wg.Wait()
 	c.svc.getProgress().FinishShared()
-	printStderr("\r\n")
+	c.out.printStderr("\r\n")
 	log(ctx).Infof("Migration finished.")
 
 	return nil
 }
 
 func (c *commandSnapshotMigrate) openSourceRepo(ctx context.Context) (repo.Repository, error) {
-	pass, ok := repo.GetPersistedPassword(ctx, c.migrateSourceConfig)
-	if !ok {
-		var err error
+	pass, err := c.svc.passwordPersistenceStrategy().GetPassword(ctx, c.migrateSourceConfig)
+	if err != nil {
+		pass, err = c.svc.getPasswordFromFlags(ctx, false, false)
+	}
 
-		if pass, err = c.svc.getPasswordFromFlags(ctx, false, false); err != nil {
-			return nil, errors.Wrap(err, "source repository password")
-		}
+	if err != nil {
+		return nil, errors.Wrap(err, "source repository password")
 	}
 
 	sourceRepo, err := repo.Open(ctx, c.migrateSourceConfig, pass, c.svc.optionsFromFlags(ctx))
@@ -193,7 +195,7 @@ func (c *commandSnapshotMigrate) migrateSinglePolicy(ctx context.Context, source
 
 	log(ctx).Infof("migrating policy for %v", si)
 
-	return policy.SetPolicy(ctx, destRepo, si, pol)
+	return errors.Wrap(policy.SetPolicy(ctx, destRepo, si, pol), "error setting policy")
 }
 
 func (c *commandSnapshotMigrate) findPreviousSnapshotManifestWithStartTime(ctx context.Context, rep repo.Repository, sourceInfo snapshot.SourceInfo, startTime time.Time) (*snapshot.Manifest, error) {
@@ -312,6 +314,7 @@ func (c *commandSnapshotMigrate) getSourcesToMigrate(ctx context.Context, rep re
 	}
 
 	if c.migrateAll {
+		// nolint:wrapcheck
 		return snapshot.ListSources(ctx, rep)
 	}
 

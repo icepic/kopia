@@ -3,7 +3,6 @@ package content
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
 	"encoding/binary"
 	"io"
 	"sort"
@@ -12,14 +11,15 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/compression"
 )
 
 const (
-	packHeaderSize = 8
-	deletedMarker  = 0x80000000
-
-	entryFixedHeaderLength = 20
-	randomSuffixSize       = 32
+	v1IndexVersion  = 1
+	v1HeaderSize    = 8
+	v1DeletedMarker = 0x80000000
+	v1MaxEntrySize  = 256 // maximum length of content ID + per-entry data combined
+	v1EntryLength   = 20
 )
 
 // FormatV1 describes a format of a single pack index. The actual structure is not used,
@@ -67,9 +67,8 @@ func (e indexEntryInfoV1) GetPackBlobID() blob.ID {
 
 	var nameBuf [256]byte
 
-	n, err := e.b.readerAt.ReadAt(nameBuf[0:nameLength], int64(nameOffset))
-	if err != nil || n != nameLength {
-		return "-invalid-blob-id-"
+	if err := readAtAll(e.b.readerAt, nameBuf[0:nameLength], int64(nameOffset)); err != nil {
+		return invalidBlobID
 	}
 
 	return blob.ID(nameBuf[0:nameLength])
@@ -98,18 +97,18 @@ func (e indexEntryInfoV1) Timestamp() time.Time {
 	return time.Unix(e.GetTimestampSeconds(), 0)
 }
 
+func (e indexEntryInfoV1) GetCompressionHeaderID() compression.HeaderID {
+	return 0
+}
+
+func (e indexEntryInfoV1) GetEncryptionKeyID() byte {
+	return 0
+}
+
 var _ Info = indexEntryInfoV1{}
 
-func decodeBigEndianUint48(d string) int64 {
-	return int64(d[0])<<40 | int64(d[1])<<32 | int64(d[2])<<24 | int64(d[3])<<16 | int64(d[4])<<8 | int64(d[5])
-}
-
-func decodeBigEndianUint32(d string) uint32 {
-	return uint32(d[0])<<24 | uint32(d[1])<<16 | uint32(d[2])<<8 | uint32(d[3])
-}
-
 type indexV1 struct {
-	hdr      headerInfo
+	hdr      v1HeaderInfo
 	readerAt io.ReaderAt
 	// v1 index does not explicitly store per-content length so we compute it from packed length and fixed overhead
 	// provided by the encryptor.
@@ -133,8 +132,7 @@ func (b *indexV1) Iterate(r IDRange, cb func(Info) error) error {
 	entry := make([]byte, stride)
 
 	for i := startPos; i < b.hdr.entryCount; i++ {
-		n, err := b.readerAt.ReadAt(entry, int64(packHeaderSize+stride*i))
-		if err != nil || n != len(entry) {
+		if err := readAtAll(b.readerAt, entry, int64(v1HeaderSize+stride*i)); err != nil {
 			return errors.Wrap(err, "unable to read from index")
 		}
 
@@ -161,7 +159,7 @@ func (b *indexV1) Iterate(r IDRange, cb func(Info) error) error {
 func (b *indexV1) findEntryPosition(contentID ID) (int, error) {
 	stride := b.hdr.keySize + b.hdr.valueSize
 
-	var entryArr [maxEntrySize]byte
+	var entryArr [v1MaxEntrySize]byte
 
 	var entryBuf []byte
 
@@ -177,8 +175,8 @@ func (b *indexV1) findEntryPosition(contentID ID) (int, error) {
 		if readErr != nil {
 			return false
 		}
-		_, err := b.readerAt.ReadAt(entryBuf, int64(packHeaderSize+stride*p))
-		if err != nil {
+
+		if err := readAtAll(b.readerAt, entryBuf, int64(v1HeaderSize+stride*p)); err != nil {
 			readErr = err
 			return false
 		}
@@ -198,8 +196,8 @@ func (b *indexV1) findEntryPositionExact(idBytes, entryBuf []byte) (int, error) 
 		if readErr != nil {
 			return false
 		}
-		_, err := b.readerAt.ReadAt(entryBuf, int64(packHeaderSize+stride*p))
-		if err != nil {
+
+		if err := readAtAll(b.readerAt, entryBuf, int64(v1HeaderSize+stride*p)); err != nil {
 			readErr = err
 			return false
 		}
@@ -226,7 +224,7 @@ func (b *indexV1) findEntry(output []byte, contentID ID) ([]byte, error) {
 
 	stride := b.hdr.keySize + b.hdr.valueSize
 
-	var entryArr [maxEntrySize]byte
+	var entryArr [v1MaxEntrySize]byte
 
 	var entryBuf []byte
 
@@ -245,7 +243,7 @@ func (b *indexV1) findEntry(output []byte, contentID ID) ([]byte, error) {
 		return nil, nil
 	}
 
-	if _, err := b.readerAt.ReadAt(entryBuf, int64(packHeaderSize+stride*position)); err != nil {
+	if err := readAtAll(b.readerAt, entryBuf, int64(v1HeaderSize+stride*position)); err != nil {
 		return nil, errors.Wrap(err, "error reading header")
 	}
 
@@ -258,7 +256,7 @@ func (b *indexV1) findEntry(output []byte, contentID ID) ([]byte, error) {
 
 // GetInfo returns information about a given content. If a content is not found, nil is returned.
 func (b *indexV1) GetInfo(contentID ID) (Info, error) {
-	var entryBuf [maxEntrySize]byte
+	var entryBuf [v1MaxEntrySize]byte
 
 	e, err := b.findEntry(entryBuf[:0], contentID)
 	if err != nil {
@@ -273,7 +271,7 @@ func (b *indexV1) GetInfo(contentID ID) (Info, error) {
 }
 
 func (b *indexV1) entryToInfo(contentID ID, entryData []byte) (Info, error) {
-	if len(entryData) < entryFixedHeaderLength {
+	if len(entryData) != v1EntryLength {
 		return nil, errors.Errorf("invalid entry length: %v", len(entryData))
 	}
 
@@ -284,7 +282,7 @@ func (b *indexV1) entryToInfo(contentID ID, entryData []byte) (Info, error) {
 // Close closes the index and the underlying reader.
 func (b *indexV1) Close() error {
 	if closer, ok := b.readerAt.(io.Closer); ok {
-		return closer.Close()
+		return errors.Wrap(closer.Close(), "error closing index file")
 	}
 
 	return nil
@@ -304,7 +302,7 @@ func (b packIndexBuilder) buildV1(output io.Writer) error {
 	b1 := &indexBuilderV1{
 		packBlobIDOffsets: map[blob.ID]uint32{},
 		keyLength:         -1,
-		entryLength:       entryFixedHeaderLength,
+		entryLength:       v1EntryLength,
 		entryCount:        len(allContents),
 	}
 
@@ -314,7 +312,7 @@ func (b packIndexBuilder) buildV1(output io.Writer) error {
 	extraData := b1.prepareExtraData(allContents)
 
 	// write header
-	header := make([]byte, packHeaderSize)
+	header := make([]byte, v1HeaderSize)
 	header[0] = 1 // version
 	header[1] = byte(b1.keyLength)
 	binary.BigEndian.PutUint16(header[2:4], uint16(b1.entryLength))
@@ -337,16 +335,7 @@ func (b packIndexBuilder) buildV1(output io.Writer) error {
 		return errors.Wrap(err, "error writing extra data")
 	}
 
-	randomSuffix := make([]byte, randomSuffixSize)
-	if _, err := rand.Read(randomSuffix); err != nil {
-		return errors.Wrap(err, "error getting random bytes for suffix")
-	}
-
-	if _, err := w.Write(randomSuffix); err != nil {
-		return errors.Wrap(err, "error writing extra random suffix to ensure indexes are always globally unique")
-	}
-
-	return w.Flush()
+	return errors.Wrap(w.Flush(), "error flushing index")
 }
 
 func (b *indexBuilderV1) prepareExtraData(allContents []Info) []byte {
@@ -367,7 +356,7 @@ func (b *indexBuilderV1) prepareExtraData(allContents []Info) []byte {
 		}
 	}
 
-	b.extraDataOffset = uint32(packHeaderSize + b.entryCount*(b.keyLength+b.entryLength))
+	b.extraDataOffset = uint32(v1HeaderSize + b.entryCount*(b.keyLength+b.entryLength))
 
 	return extraData
 }
@@ -379,6 +368,14 @@ func (b *indexBuilderV1) writeEntry(w io.Writer, it Info, entry []byte) error {
 
 	if len(k) != b.keyLength {
 		return errors.Errorf("inconsistent key length: %v vs %v", len(k), b.keyLength)
+	}
+
+	if it.GetCompressionHeaderID() != 0 {
+		return errors.Errorf("compression not supported in index v1")
+	}
+
+	if it.GetEncryptionKeyID() != 0 {
+		return errors.Errorf("encryption key ID not supported in index v1")
 	}
 
 	if err := b.formatEntry(entry, it); err != nil {
@@ -411,7 +408,7 @@ func (b *indexBuilderV1) formatEntry(entry []byte, it Info) error {
 	binary.BigEndian.PutUint32(entryPackFileOffset, b.extraDataOffset+b.packBlobIDOffsets[packBlobID])
 
 	if it.GetDeleted() {
-		binary.BigEndian.PutUint32(entryPackedOffset, it.GetPackOffset()|deletedMarker)
+		binary.BigEndian.PutUint32(entryPackedOffset, it.GetPackOffset()|v1DeletedMarker)
 	} else {
 		binary.BigEndian.PutUint32(entryPackedOffset, it.GetPackOffset())
 	}
@@ -422,4 +419,36 @@ func (b *indexBuilderV1) formatEntry(entry []byte, it Info) error {
 	binary.BigEndian.PutUint64(entryTimestampAndFlags, timestampAndFlags)
 
 	return nil
+}
+
+type v1HeaderInfo struct {
+	version    int
+	keySize    int
+	valueSize  int
+	entryCount int
+}
+
+func v1ReadHeader(readerAt io.ReaderAt) (v1HeaderInfo, error) {
+	var header [8]byte
+
+	if err := readAtAll(readerAt, header[:], 0); err != nil {
+		return v1HeaderInfo{}, errors.Wrap(err, "invalid header")
+	}
+
+	hi := v1HeaderInfo{
+		version:    int(header[0]),
+		keySize:    int(header[1]),
+		valueSize:  int(binary.BigEndian.Uint16(header[2:4])),
+		entryCount: int(binary.BigEndian.Uint32(header[4:8])),
+	}
+
+	if hi.keySize <= 1 || hi.valueSize < 0 || hi.entryCount < 0 {
+		return v1HeaderInfo{}, errors.Errorf("invalid header")
+	}
+
+	return hi, nil
+}
+
+func openV1PackIndex(hdr v1HeaderInfo, readerAt io.ReaderAt, overhead uint32) (packIndex, error) {
+	return &indexV1{hdr, readerAt, overhead}, nil
 }

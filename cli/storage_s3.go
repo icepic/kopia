@@ -13,7 +13,7 @@ type storageS3Flags struct {
 	s3options s3.Options
 }
 
-func (c *storageS3Flags) setup(cmd *kingpin.CmdClause) {
+func (c *storageS3Flags) setup(_ storageProviderServices, cmd *kingpin.CmdClause) {
 	cmd.Flag("bucket", "Name of the S3 bucket").Required().StringVar(&c.s3options.BucketName)
 	cmd.Flag("endpoint", "Endpoint to use").Default("s3.amazonaws.com").StringVar(&c.s3options.Endpoint)
 	cmd.Flag("region", "S3 Region").Default("").StringVar(&c.s3options.Region)
@@ -28,5 +28,6 @@ func (c *storageS3Flags) setup(cmd *kingpin.CmdClause) {
 }
 
 func (c *storageS3Flags) connect(ctx context.Context, isNew bool) (blob.Storage, error) {
+	// nolint:wrapcheck
 	return s3.New(ctx, &c.s3options)
 }

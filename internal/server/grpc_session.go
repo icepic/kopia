@@ -19,6 +19,7 @@ import (
 	"github.com/kopia/kopia/internal/auth"
 	"github.com/kopia/kopia/internal/grpcapi"
 	"github.com/kopia/kopia/repo"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/manifest"
 	"github.com/kopia/kopia/repo/object"
@@ -99,7 +100,8 @@ func (s *Server) Session(srv grpcapi.KopiaRepository_SessionServer) error {
 		return err
 	}
 
-	return repo.DirectWriteSession(ctx, dr, opt, func(dw repo.DirectRepositoryWriter) error {
+	// nolint:wrapcheck
+	return repo.DirectWriteSession(ctx, dr, opt, func(ctx context.Context, dw repo.DirectRepositoryWriter) error {
 		// channel to which workers will be sending errors, only holds 1 slot and sends are non-blocking.
 		lastErr := make(chan error, 1)
 
@@ -229,7 +231,7 @@ func handleWriteContentRequest(ctx context.Context, dw repo.DirectRepositoryWrit
 		return accessDeniedResponse()
 	}
 
-	contentID, err := dw.ContentManager().WriteContent(ctx, req.GetData(), content.ID(req.GetPrefix()))
+	contentID, err := dw.ContentManager().WriteContent(ctx, req.GetData(), content.ID(req.GetPrefix()), compression.HeaderID(req.GetCompression()))
 	if err != nil {
 		return errorResponse(err)
 	}
@@ -419,9 +421,10 @@ func (s *Server) handleInitialSessionHandshake(srv grpcapi.KopiaRepository_Sessi
 		Response: &grpcapi.SessionResponse_InitializeSession{
 			InitializeSession: &grpcapi.InitializeSessionResponse{
 				Parameters: &grpcapi.RepositoryParameters{
-					HashFunction: dr.ContentReader().ContentFormat().Hash,
-					HmacSecret:   dr.ContentReader().ContentFormat().HMACSecret,
-					Splitter:     dr.ObjectFormat().Splitter,
+					HashFunction:               dr.ContentReader().ContentFormat().Hash,
+					HmacSecret:                 dr.ContentReader().ContentFormat().HMACSecret,
+					Splitter:                   dr.ObjectFormat().Splitter,
+					SupportsContentCompression: dr.ContentReader().SupportsContentCompression(),
 				},
 			},
 		},

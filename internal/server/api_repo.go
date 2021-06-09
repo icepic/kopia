@@ -8,6 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/kopia/kopia/internal/passwordpersist"
 	"github.com/kopia/kopia/internal/remoterepoapi"
 	"github.com/kopia/kopia/internal/serverapi"
 	"github.com/kopia/kopia/repo"
@@ -29,9 +30,10 @@ func (s *Server) handleRepoParameters(ctx context.Context, r *http.Request, body
 	}
 
 	rp := &remoterepoapi.Parameters{
-		HashFunction: dr.ContentReader().ContentFormat().Hash,
-		HMACSecret:   dr.ContentReader().ContentFormat().HMACSecret,
-		Format:       dr.ObjectFormat(),
+		HashFunction:               dr.ContentReader().ContentFormat().Hash,
+		HMACSecret:                 dr.ContentReader().ContentFormat().HMACSecret,
+		Format:                     dr.ObjectFormat(),
+		SupportsContentCompression: dr.ContentReader().SupportsContentCompression(),
 	}
 
 	return rp, nil
@@ -47,19 +49,21 @@ func (s *Server) handleRepoStatus(ctx context.Context, r *http.Request, body []b
 	dr, ok := s.rep.(repo.DirectRepository)
 	if ok {
 		return &serverapi.StatusResponse{
-			Connected:     true,
-			ConfigFile:    dr.ConfigFilename(),
-			Hash:          dr.ContentReader().ContentFormat().Hash,
-			Encryption:    dr.ContentReader().ContentFormat().Encryption,
-			MaxPackSize:   dr.ContentReader().ContentFormat().MaxPackSize,
-			Splitter:      dr.ObjectFormat().Splitter,
-			Storage:       dr.BlobReader().ConnectionInfo().Type,
-			ClientOptions: dr.ClientOptions(),
+			Connected:                  true,
+			ConfigFile:                 dr.ConfigFilename(),
+			Hash:                       dr.ContentReader().ContentFormat().Hash,
+			Encryption:                 dr.ContentReader().ContentFormat().Encryption,
+			MaxPackSize:                dr.ContentReader().ContentFormat().MaxPackSize,
+			Splitter:                   dr.ObjectFormat().Splitter,
+			Storage:                    dr.BlobReader().ConnectionInfo().Type,
+			ClientOptions:              dr.ClientOptions(),
+			SupportsContentCompression: dr.ContentReader().SupportsContentCompression(),
 		}, nil
 	}
 
 	type remoteRepository interface {
 		APIServerURL() string
+		SupportsContentCompression() bool
 	}
 
 	result := &serverapi.StatusResponse{
@@ -69,6 +73,7 @@ func (s *Server) handleRepoStatus(ctx context.Context, r *http.Request, body []b
 
 	if rr, ok := s.rep.(remoteRepository); ok {
 		result.APIServerURL = rr.APIServerURL()
+		result.SupportsContentCompression = rr.SupportsContentCompression()
 	}
 
 	return result, nil
@@ -121,7 +126,7 @@ func (s *Server) handleRepoCreate(ctx context.Context, r *http.Request, body []b
 
 	if err := repo.WriteSession(ctx, s.rep, repo.WriteSessionOptions{
 		Purpose: "handleRepoCreate",
-	}, func(w repo.RepositoryWriter) error {
+	}, func(ctx context.Context, w repo.RepositoryWriter) error {
 		if err := policy.SetPolicy(ctx, w, policy.GlobalPolicySourceInfo, policy.DefaultPolicy); err != nil {
 			return errors.Wrap(err, "set global policy")
 		}
@@ -243,7 +248,9 @@ func (s *Server) getConnectOptions(cliOpts repo.ClientOptions) *repo.ConnectOpti
 }
 
 func (s *Server) connectAPIServerAndOpen(ctx context.Context, si *repo.APIServerInfo, password string, cliOpts repo.ClientOptions) *apiError {
-	if err := repo.ConnectAPIServer(ctx, s.options.ConfigFile, si, password, s.getConnectOptions(cliOpts)); err != nil {
+	if err := passwordpersist.OnSuccess(
+		ctx, repo.ConnectAPIServer(ctx, s.options.ConfigFile, si, password, s.getConnectOptions(cliOpts)),
+		s.options.PasswordPersist, s.options.ConfigFile, password); err != nil {
 		return repoErrorToAPIError(err)
 	}
 
@@ -257,7 +264,9 @@ func (s *Server) connectAndOpen(ctx context.Context, conn blob.ConnectionInfo, p
 	}
 	defer st.Close(ctx) //nolint:errcheck
 
-	if err = repo.Connect(ctx, s.options.ConfigFile, st, password, s.getConnectOptions(cliOpts)); err != nil {
+	if err = passwordpersist.OnSuccess(
+		ctx, repo.Connect(ctx, s.options.ConfigFile, st, password, s.getConnectOptions(cliOpts)),
+		s.options.PasswordPersist, s.options.ConfigFile, password); err != nil {
 		return repoErrorToAPIError(err)
 	}
 
@@ -294,6 +303,10 @@ func (s *Server) handleRepoDisconnect(ctx context.Context, r *http.Request, body
 	}
 
 	if err := repo.Disconnect(ctx, s.options.ConfigFile); err != nil {
+		return nil, internalServerError(err)
+	}
+
+	if err := s.options.PasswordPersist.DeletePassword(ctx, s.options.ConfigFile); err != nil {
 		return nil, internalServerError(err)
 	}
 

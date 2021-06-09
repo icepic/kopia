@@ -109,6 +109,7 @@ func ListAllBlobs(ctx context.Context, st Storage, prefix ID) ([]Metadata, error
 // IterateAllPrefixesInParallel invokes the provided callback and returns the first error returned by the callback or nil.
 func IterateAllPrefixesInParallel(ctx context.Context, parallelism int, st Storage, prefixes []ID, callback func(Metadata) error) error {
 	if len(prefixes) == 1 {
+		// nolint:wrapcheck
 		return st.ListBlobs(ctx, prefixes[0], callback)
 	}
 
@@ -176,4 +177,15 @@ func EnsureLengthAndTruncate(b []byte, length int64) ([]byte, error) {
 	}
 
 	return b[0:length], nil
+}
+
+// IDsFroMetadata returns IDs for blobs in Metadata slice.
+func IDsFroMetadata(mds []Metadata) []ID {
+	ids := make([]ID, len(mds))
+
+	for i, md := range mds {
+		ids[i] = md.BlobID
+	}
+
+	return ids
 }

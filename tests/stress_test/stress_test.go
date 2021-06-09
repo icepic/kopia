@@ -41,7 +41,7 @@ func stressTestWithStorage(t *testing.T, st blob.Storage, duration time.Duration
 	ctx := testlogging.Context(t)
 
 	openMgr := func() (*content.WriteManager, error) {
-		return content.NewManager(ctx, st, &content.FormattingOptions{
+		return content.NewManagerForTesting(ctx, st, &content.FormattingOptions{
 			Version:     1,
 			Hash:        "HMAC-SHA256-128",
 			Encryption:  encryption.DefaultAlgorithm,
@@ -95,7 +95,7 @@ func stressWorker(ctx context.Context, t *testing.T, deadline time.Time, openMgr
 
 		dataCopy := append([]byte{}, data...)
 
-		contentID, err := bm.WriteContent(ctx, data, "")
+		contentID, err := bm.WriteContent(ctx, data, "", content.NoCompression)
 		if err != nil {
 			t.Errorf("err: %v", err)
 			return

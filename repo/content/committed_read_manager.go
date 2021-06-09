@@ -1,9 +1,9 @@
 package content
 
 import (
+	"bytes"
 	"context"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,9 +13,14 @@ import (
 	"github.com/kopia/kopia/internal/cache"
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/repo/blob"
-	"github.com/kopia/kopia/repo/encryption"
+	"github.com/kopia/kopia/repo/compression"
 	"github.com/kopia/kopia/repo/hashing"
+	"github.com/kopia/kopia/repo/logging"
 )
+
+// number of bytes to read from each pack index when recovering the index.
+// per-pack indexes are usually short (<100-200 contents).
+const indexRecoverPostambleSize = 8192
 
 // SharedManager is responsible for read-only access to committed data.
 type SharedManager struct {
@@ -28,8 +33,7 @@ type SharedManager struct {
 	contentCache      contentCache
 	metadataCache     contentCache
 	committedContents *committedContentIndex
-	hasher            hashing.HashFunc
-	encryptor         encryption.Encryptor
+	crypter           *Crypter
 	timeNow           func() time.Time
 
 	format                  FormattingOptions
@@ -40,15 +44,46 @@ type SharedManager struct {
 	maxPreambleLength       int
 	paddingUnit             int
 	repositoryFormatBytes   []byte
+	indexVersion            int
+	encryptionBufferPool    *buf.Pool
 
-	encryptionBufferPool *buf.Pool
+	// logger where logs should be written
+	log logging.Logger
+
+	// base logger used by other related components with their own prefixes,
+	// do not log there directly.
+	sharedBaseLogger   logging.Logger
+	internalLogManager *internalLogManager
+	internalLogger     *internalLogger // backing logger for 'sharedBaseLogger'
+}
+
+// Crypter returns the crypter.
+func (sm *SharedManager) Crypter() *Crypter {
+	return sm.crypter
 }
 
 func (sm *SharedManager) readPackFileLocalIndex(ctx context.Context, packFile blob.ID, packFileLength int64) ([]byte, error) {
-	// TODO(jkowalski): optimize read when packFileLength is provided
-	_ = packFileLength
+	if packFileLength >= indexRecoverPostambleSize {
+		data, err := sm.attemptReadPackFileLocalIndex(ctx, packFile, packFileLength-indexRecoverPostambleSize, indexRecoverPostambleSize)
+		if err == nil {
+			sm.log.Debugf("recovered %v index bytes from blob %v using optimized method", len(data), packFile)
+			return data, nil
+		}
 
-	payload, err := sm.st.GetBlob(ctx, packFile, 0, -1)
+		sm.log.Debugf("unable to recover using optimized method: %v", err)
+	}
+
+	data, err := sm.attemptReadPackFileLocalIndex(ctx, packFile, 0, -1)
+	if err == nil {
+		sm.log.Debugf("recovered %v index bytes from blob %v using full blob read", len(data), packFile)
+		return data, nil
+	}
+
+	return nil, err
+}
+
+func (sm *SharedManager) attemptReadPackFileLocalIndex(ctx context.Context, packFile blob.ID, offset, length int64) ([]byte, error) {
+	payload, err := sm.st.GetBlob(ctx, packFile, offset, length)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error getting blob %v", packFile)
 	}
@@ -58,9 +93,15 @@ func (sm *SharedManager) readPackFileLocalIndex(ctx context.Context, packFile bl
 		return nil, errors.Errorf("unable to find valid postamble in file %v", packFile)
 	}
 
+	if uint32(offset) > postamble.localIndexOffset {
+		return nil, errors.Errorf("not enough data read during optimized attempt %v", packFile)
+	}
+
+	postamble.localIndexOffset -= uint32(offset)
+
 	if uint64(postamble.localIndexOffset+postamble.localIndexLength) > uint64(len(payload)) {
 		// invalid offset/length
-		return nil, errors.Errorf("unable to find valid local index in file %v", packFile)
+		return nil, errors.Errorf("unable to find valid local index in file %v - invalid offset/length", packFile)
 	}
 
 	encryptedLocalIndexBytes := payload[postamble.localIndexOffset : postamble.localIndexOffset+postamble.localIndexLength]
@@ -76,127 +117,52 @@ func (sm *SharedManager) readPackFileLocalIndex(ctx context.Context, packFile bl
 	return localIndexBytes, nil
 }
 
-func (sm *SharedManager) loadPackIndexesUnlocked(ctx context.Context) ([]IndexBlobInfo, bool, error) {
+func (sm *SharedManager) loadPackIndexesUnlocked(ctx context.Context) ([]IndexBlobInfo, error) {
 	nextSleepTime := 100 * time.Millisecond //nolint:gomnd
 
 	for i := 0; i < indexLoadAttempts; i++ {
 		if err := ctx.Err(); err != nil {
 			// nolint:wrapcheck
-			return nil, false, err
+			return nil, err
 		}
 
 		if i > 0 {
 			sm.indexBlobManager.flushCache()
-			log(ctx).Debugf("encountered NOT_FOUND when loading, sleeping %v before retrying #%v", nextSleepTime, i)
+			sm.log.Debugf("encountered NOT_FOUND when loading, sleeping %v before retrying #%v", nextSleepTime, i)
 			time.Sleep(nextSleepTime)
 			nextSleepTime *= 2
 		}
 
-		indexBlobs, err := sm.indexBlobManager.listIndexBlobs(ctx, false)
+		indexBlobs, err := sm.indexBlobManager.listActiveIndexBlobs(ctx)
 		if err != nil {
-			return nil, false, errors.Wrap(err, "error listing index blobs")
+			return nil, errors.Wrap(err, "error listing index blobs")
 		}
 
-		err = sm.tryLoadPackIndexBlobsUnlocked(ctx, indexBlobs)
+		var indexBlobIDs []blob.ID
+		for _, b := range indexBlobs {
+			indexBlobIDs = append(indexBlobIDs, b.BlobID)
+		}
+
+		err = sm.committedContents.fetchIndexBlobs(ctx, indexBlobIDs)
 		if err == nil {
-			var indexBlobIDs []blob.ID
-			for _, b := range indexBlobs {
-				indexBlobIDs = append(indexBlobIDs, b.BlobID)
-			}
-
-			var updated bool
-
-			updated, err = sm.committedContents.use(ctx, indexBlobIDs)
+			err = sm.committedContents.use(ctx, indexBlobIDs)
 			if err != nil {
-				return nil, false, err
+				return nil, err
 			}
 
 			if len(indexBlobs) > indexBlobCompactionWarningThreshold {
-				log(ctx).Errorf("Found too many index blobs (%v), this may result in degraded performance.\n\nPlease ensure periodic repository maintenance is enabled or run 'kopia maintenance'.", len(indexBlobs))
+				sm.log.Errorf("Found too many index blobs (%v), this may result in degraded performance.\n\nPlease ensure periodic repository maintenance is enabled or run 'kopia maintenance'.", len(indexBlobs))
 			}
 
-			return indexBlobs, updated, nil
+			return indexBlobs, nil
 		}
 
 		if !errors.Is(err, blob.ErrBlobNotFound) {
-			return nil, false, err
+			return nil, err
 		}
 	}
 
-	return nil, false, errors.Errorf("unable to load pack indexes despite %v retries", indexLoadAttempts)
-}
-
-func (sm *SharedManager) tryLoadPackIndexBlobsUnlocked(ctx context.Context, indexBlobs []IndexBlobInfo) error {
-	ch, unprocessedIndexesSize, err := sm.unprocessedIndexBlobsUnlocked(ctx, indexBlobs)
-	if err != nil {
-		return err
-	}
-
-	if len(ch) == 0 {
-		return nil
-	}
-
-	log(ctx).Debugf("downloading %v new index blobs (%v bytes)...", len(ch), unprocessedIndexesSize)
-
-	var wg sync.WaitGroup
-
-	errch := make(chan error, parallelFetches)
-
-	for i := 0; i < parallelFetches; i++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			for indexBlobID := range ch {
-				data, err := sm.indexBlobManager.getIndexBlob(ctx, indexBlobID)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				if err := sm.committedContents.addContent(ctx, indexBlobID, data, false); err != nil {
-					errch <- errors.Wrap(err, "unable to add to committed content cache")
-					return
-				}
-			}
-		}()
-	}
-
-	wg.Wait()
-	close(errch)
-
-	// Propagate async errors, if any.
-	for err := range errch {
-		return err
-	}
-
-	log(ctx).Debugf("Index contents downloaded.")
-
-	return nil
-}
-
-// unprocessedIndexBlobsUnlocked returns a closed channel filled with content IDs that are not in committedContents cache.
-func (sm *SharedManager) unprocessedIndexBlobsUnlocked(ctx context.Context, contents []IndexBlobInfo) (resultCh <-chan blob.ID, totalSize int64, err error) {
-	ch := make(chan blob.ID, len(contents))
-	defer close(ch)
-
-	for _, c := range contents {
-		has, err := sm.committedContents.cache.hasIndexBlobID(ctx, c.BlobID)
-		if err != nil {
-			return nil, 0, errors.Wrapf(err, "error determining whether index blob %v has been downloaded", c.BlobID)
-		}
-
-		if has {
-			formatLog(ctx).Debugf("index-already-cached %v", c.BlobID)
-			continue
-		}
-
-		ch <- c.BlobID
-		totalSize += c.Length
-	}
-
-	return ch, totalSize, nil
+	return nil, errors.Errorf("unable to load pack indexes despite %v retries", indexLoadAttempts)
 }
 
 func (sm *SharedManager) getCacheForContentID(id ID) contentCache {
@@ -210,11 +176,16 @@ func (sm *SharedManager) getCacheForContentID(id ID) contentCache {
 func (sm *SharedManager) decryptContentAndVerify(payload []byte, bi Info) ([]byte, error) {
 	sm.Stats.readContent(len(payload))
 
-	var hashBuf [maxHashSize]byte
+	var hashBuf [hashing.MaxHashSize]byte
 
 	iv, err := getPackedContentIV(hashBuf[:], bi.GetContentID())
 	if err != nil {
 		return nil, err
+	}
+
+	// reserved for future use
+	if k := bi.GetEncryptionKeyID(); k != 0 {
+		return nil, errors.Errorf("unsupported encryption key ID: %v", k)
 	}
 
 	decrypted, err := sm.decryptAndVerify(payload, iv)
@@ -222,11 +193,26 @@ func (sm *SharedManager) decryptContentAndVerify(payload []byte, bi Info) ([]byt
 		return nil, errors.Wrapf(err, "invalid checksum at %v offset %v length %v", bi.GetPackBlobID(), bi.GetPackOffset(), len(payload))
 	}
 
+	if h := bi.GetCompressionHeaderID(); h != 0 {
+		c := compression.ByHeaderID[h]
+		if c == nil {
+			return nil, errors.Errorf("unsupported compressor %x", h)
+		}
+
+		out := bytes.NewBuffer(nil)
+
+		if err := c.Decompress(out, decrypted); err != nil {
+			return nil, errors.Wrap(err, "error decompressing")
+		}
+
+		return out.Bytes(), nil
+	}
+
 	return decrypted, nil
 }
 
 func (sm *SharedManager) decryptAndVerify(encrypted, iv []byte) ([]byte, error) {
-	decrypted, err := sm.encryptor.Decrypt(nil, encrypted, iv)
+	decrypted, err := sm.crypter.Encryptor.Decrypt(nil, encrypted, iv)
 	if err != nil {
 		sm.Stats.foundInvalidContent()
 		return nil, errors.Wrap(err, "decrypt")
@@ -241,7 +227,13 @@ func (sm *SharedManager) decryptAndVerify(encrypted, iv []byte) ([]byte, error) 
 
 // IndexBlobs returns the list of active index blobs.
 func (sm *SharedManager) IndexBlobs(ctx context.Context, includeInactive bool) ([]IndexBlobInfo, error) {
-	return sm.indexBlobManager.listIndexBlobs(ctx, includeInactive)
+	if includeInactive {
+		// nolint:wrapcheck
+		return sm.indexBlobManager.listAllIndexBlobs(ctx)
+	}
+
+	// nolint:wrapcheck
+	return sm.indexBlobManager.listActiveIndexBlobs(ctx)
 }
 
 func (sm *SharedManager) setupReadManagerCaches(ctx context.Context, caching *CachingOptions) error {
@@ -270,33 +262,31 @@ func (sm *SharedManager) setupReadManagerCaches(ctx context.Context, caching *Ca
 		return errors.Wrap(err, "unable to initialize metadata cache")
 	}
 
-	listCache, err := newListCache(sm.st, caching)
+	listCache, err := newListCache(sm.st, caching, sm.sharedBaseLogger)
 	if err != nil {
 		return errors.Wrap(err, "unable to initialize list cache")
 	}
 
 	// this is test action to allow test to specify custom cache
-	owc, err := newOwnWritesCache(ctx, caching, sm.timeNow)
+	owc, err := newOwnWritesCache(ctx, caching, sm.timeNow, sm.sharedBaseLogger)
 	if err != nil {
 		return errors.Wrap(err, "unable to initialize own writes cache")
 	}
 
-	contentIndex := newCommittedContentIndex(caching, uint32(sm.encryptor.Overhead()))
-
-	// once everything is ready, set it up
-	sm.contentCache = dataCache
-	sm.metadataCache = metadataCache
-	sm.committedContents = contentIndex
-
 	sm.indexBlobManager = &indexBlobManagerImpl{
 		st:             sm.st,
-		encryptor:      sm.encryptor,
-		hasher:         sm.hasher,
+		crypter:        sm.crypter,
 		timeNow:        sm.timeNow,
 		ownWritesCache: owc,
 		listCache:      listCache,
 		indexBlobCache: metadataCache,
+		log:            logging.WithPrefix("[index-blob-manager] ", sm.sharedBaseLogger),
 	}
+
+	// once everything is ready, set it up
+	sm.contentCache = dataCache
+	sm.metadataCache = metadataCache
+	sm.committedContents = newCommittedContentIndex(caching, uint32(sm.crypter.Encryptor.Overhead()), sm.indexVersion, sm.indexBlobManager.getIndexBlob, sm.sharedBaseLogger)
 
 	return nil
 }
@@ -312,25 +302,42 @@ func (sm *SharedManager) addRef() {
 
 // release removes a reference to the shared manager and destroys it if no more references are remaining.
 func (sm *SharedManager) release(ctx context.Context) error {
+	if atomic.LoadInt32(&sm.closed) != 0 {
+		// already closed
+		return nil
+	}
+
 	remaining := atomic.AddInt32(&sm.refCount, -1)
 	if remaining != 0 {
-		log(ctx).Debugf("not closing shared manager, remaining = %v", remaining)
+		sm.log.Debugf("not closing shared manager, remaining = %v", remaining)
+
 		return nil
 	}
 
 	atomic.StoreInt32(&sm.closed, 1)
 
-	log(ctx).Debugf("closing shared manager")
+	sm.log.Debugf("closing shared manager")
 
 	if err := sm.committedContents.close(); err != nil {
-		return errors.Wrap(err, "error closed committed content index")
+		return errors.Wrap(err, "error closing committed content index")
 	}
 
 	sm.contentCache.close(ctx)
 	sm.metadataCache.close(ctx)
 	sm.encryptionBufferPool.Close()
 
-	return sm.st.Close(ctx)
+	if sm.internalLogger != nil {
+		sm.internalLogger.Close(ctx)
+	}
+
+	sm.internalLogManager.Close(ctx)
+
+	return errors.Wrap(sm.st.Close(ctx), "error closing storage")
+}
+
+// InternalLogger returns the internal logger.
+func (sm *SharedManager) InternalLogger() logging.Logger {
+	return sm.internalLogger
 }
 
 // NewSharedManager returns SharedManager that is used by SessionWriteManagers on top of a repository.
@@ -348,15 +355,38 @@ func NewSharedManager(ctx context.Context, st blob.Storage, f *FormattingOptions
 		return nil, errors.Errorf("can't handle repositories created using version %v (min supported %v, max supported %v)", f.Version, minSupportedWriteVersion, maxSupportedWriteVersion)
 	}
 
-	hasher, encryptor, err := CreateHashAndEncryptor(f)
+	crypter, err := CreateCrypter(f)
 	if err != nil {
 		return nil, err
 	}
 
+	actualIndexVersion := f.IndexVersion
+	if actualIndexVersion == 0 {
+		actualIndexVersion = DefaultIndexVersion
+	}
+
+	if actualIndexVersion < v1IndexVersion || actualIndexVersion > v2IndexVersion {
+		return nil, errors.Errorf("index version %v is not supported", actualIndexVersion)
+	}
+
+	// create internal logger that will be writing logs as encrypted repository blobs.
+	ilm := newInternalLogManager(ctx, st, crypter)
+
+	// sharedBaseLogger writes to the both context and internal log
+	// and is used as a base for all content manager components.
+	var internalLog *internalLogger
+
+	// capture logger (usually console or log file) associated with current context.
+	sharedBaseLogger := logging.GetContextLoggerFunc(FormatLogModule)(ctx)
+
+	if !opts.DisableInternalLog {
+		internalLog = ilm.NewLogger()
+		sharedBaseLogger = logging.Broadcast{sharedBaseLogger, internalLog}
+	}
+
 	sm := &SharedManager{
 		st:                      st,
-		encryptor:               encryptor,
-		hasher:                  hasher,
+		crypter:                 crypter,
 		Stats:                   new(Stats),
 		timeNow:                 opts.TimeNow,
 		format:                  *f,
@@ -367,7 +397,14 @@ func NewSharedManager(ctx context.Context, st blob.Storage, f *FormattingOptions
 		repositoryFormatBytes:   opts.RepositoryFormatBytes,
 		checkInvariantsOnUnlock: os.Getenv("KOPIA_VERIFY_INVARIANTS") != "",
 		writeFormatVersion:      int32(f.Version),
-		encryptionBufferPool:    buf.NewPool(ctx, defaultEncryptionBufferPoolSegmentSize+encryptor.Overhead(), "content-manager-encryption"),
+		encryptionBufferPool:    buf.NewPool(ctx, defaultEncryptionBufferPoolSegmentSize+crypter.Encryptor.Overhead()+maxCompressionOverheadPerContent, "content-manager-encryption"),
+		indexVersion:            actualIndexVersion,
+		internalLogManager:      ilm,
+		internalLogger:          internalLog,
+		sharedBaseLogger:        sharedBaseLogger,
+
+		// remember logger defined for the context.
+		log: logging.WithPrefix("[shared-manager] ", sharedBaseLogger),
 	}
 
 	caching = caching.CloneOrDefault()
@@ -376,7 +413,7 @@ func NewSharedManager(ctx context.Context, st blob.Storage, f *FormattingOptions
 		return nil, errors.Wrap(err, "error setting up read manager caches")
 	}
 
-	if _, _, err := sm.loadPackIndexesUnlocked(ctx); err != nil {
+	if _, err := sm.loadPackIndexesUnlocked(ctx); err != nil {
 		return nil, errors.Wrap(err, "error loading indexes")
 	}
 

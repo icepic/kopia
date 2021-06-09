@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 
 	"github.com/kopia/kopia/internal/blobtesting"
 	"github.com/kopia/kopia/internal/clock"
@@ -162,7 +163,6 @@ func startDockerSFTPServerOrSkip(t *testing.T, idRSA string) (host string, port 
 
 func TestSFTPStorageValid(t *testing.T) {
 	t.Parallel()
-	testutil.ProviderTest(t)
 
 	testutil.TestSkipOnCIUnlessLinuxAMD64(t)
 
@@ -200,7 +200,6 @@ func TestSFTPStorageValid(t *testing.T) {
 
 func TestInvalidServerFailsFast(t *testing.T) {
 	t.Parallel()
-	testutil.ProviderTest(t)
 
 	ctx := testlogging.Context(t)
 
@@ -220,6 +219,43 @@ func TestInvalidServerFailsFast(t *testing.T) {
 	if dt := clock.Since(t0); dt > 10*time.Second {
 		t.Fatalf("opening storage took too long, probably due to retries")
 	}
+}
+
+func TestSFTPStorageRelativeKeyFile(t *testing.T) {
+	t.Parallel()
+
+	kh := filepath.Join(t.TempDir(), "some-relative-path")
+	require.NoError(t, ioutil.WriteFile(kh, []byte{}, 0600))
+
+	opt := &sftp.Options{
+		Path:           "/upload",
+		Host:           "some-host",
+		Username:       sftpUsername,
+		Port:           22,
+		Keyfile:        "some-relative-path",
+		KnownHostsFile: kh,
+	}
+
+	_, err := sftp.New(testlogging.Context(t), opt)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "key file path must be absolute")
+}
+
+func TestSFTPStorageRelativeKnownHostsFile(t *testing.T) {
+	t.Parallel()
+
+	opt := &sftp.Options{
+		Path:           "/upload",
+		Host:           "some-host",
+		Username:       sftpUsername,
+		Port:           22,
+		Keyfile:        filepath.Join(t.TempDir(), "some-relative-path"),
+		KnownHostsFile: "some-relative-path",
+	}
+
+	_, err := sftp.New(testlogging.Context(t), opt)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "known hosts path must be absolute")
 }
 
 func deleteBlobs(ctx context.Context, t *testing.T, st blob.Storage) {

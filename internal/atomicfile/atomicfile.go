@@ -29,6 +29,8 @@ func MaybePrefixLongFilenameOnWindows(fname string) string {
 		return fname
 	}
 
+	fname = strings.TrimPrefix(fname, "\\\\?\\")
+
 	if !filepath.IsAbs(fname) {
 		// only convert absolute paths
 		return fname
@@ -50,5 +52,6 @@ func MaybePrefixLongFilenameOnWindows(fname string) string {
 
 // Write is a wrapper around atomic.WriteFile that handles long file names on Windows.
 func Write(filename string, r io.Reader) error {
+	// nolint:wrapcheck
 	return atomic.WriteFile(MaybePrefixLongFilenameOnWindows(filename), r)
 }

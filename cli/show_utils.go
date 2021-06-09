@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os"
 	"time"
 
 	"github.com/pkg/errors"
@@ -16,10 +15,12 @@ import (
 	"github.com/kopia/kopia/internal/units"
 )
 
-// TODO - remove this global.
-var timeZone string
+const oneHundredPercent = 100.0
 
-func showContentWithFlags(rd io.Reader, unzip, indentJSON bool) error {
+// TODO - remove this global.
+var timeZone = "local"
+
+func showContentWithFlags(w io.Writer, rd io.Reader, unzip, indentJSON bool) error {
 	if unzip {
 		gz, err := gzip.NewReader(rd)
 		if err != nil {
@@ -43,7 +44,7 @@ func showContentWithFlags(rd io.Reader, unzip, indentJSON bool) error {
 		rd = ioutil.NopCloser(&buf2)
 	}
 
-	if _, err := iocopy.Copy(os.Stdout, rd); err != nil {
+	if _, err := iocopy.Copy(w, rd); err != nil {
 		return errors.Wrap(err, "error copying data")
 	}
 
@@ -90,4 +91,16 @@ func convertTimezone(ts time.Time) time.Time {
 
 		return ts
 	}
+}
+
+func formatCompressionPercentage(original, compressed int64) string {
+	if compressed >= original {
+		return "0%"
+	}
+
+	if original == 0 {
+		return "0%"
+	}
+
+	return fmt.Sprintf("%.1f%%", oneHundredPercent*(1-float64(compressed)/float64(original)))
 }

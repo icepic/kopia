@@ -7,6 +7,7 @@ import (
 	"github.com/kopia/kopia/internal/faketime"
 	"github.com/kopia/kopia/internal/mockfs"
 	"github.com/kopia/kopia/repo"
+	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/snapshot"
 	"github.com/kopia/kopia/snapshot/policy"
 	"github.com/kopia/kopia/snapshot/snapshotfs"
@@ -25,7 +26,7 @@ func TestTimeFuncWiring(t *testing.T) {
 
 	r0 := rep.(repo.DirectRepository)
 
-	env.RepositoryWriter, err = r0.NewDirectWriter(ctx, repo.WriteSessionOptions{Purpose: "test"})
+	_, env.RepositoryWriter, err = r0.NewDirectWriter(ctx, repo.WriteSessionOptions{Purpose: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +43,7 @@ func TestTimeFuncWiring(t *testing.T) {
 	// verify wiring for the content layer
 	nt := ft.Advance(20 * time.Second)
 
-	cid, err := env.RepositoryWriter.ContentManager().WriteContent(ctx, []byte("foo"), "")
+	cid, err := env.RepositoryWriter.ContentManager().WriteContent(ctx, []byte("foo"), "", content.NoCompression)
 	if err != nil {
 		t.Fatal("failed to write content:", err)
 	}

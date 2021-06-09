@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/fs"
+	"github.com/kopia/kopia/snapshot"
 )
 
 // TarOutput contains the options for outputting a file system tree to a tar or .tar.gz file.
@@ -48,12 +49,18 @@ func (o *TarOutput) FinishDirectory(ctx context.Context, relativePath string, e 
 	return nil
 }
 
+// WriteDirEntry implements restore.Output interface.
+func (o *TarOutput) WriteDirEntry(ctx context.Context, relativePath string, de *snapshot.DirEntry, e fs.Directory) error {
+	return nil
+}
+
 // Close implements restore.Output interface.
 func (o *TarOutput) Close(ctx context.Context) error {
 	if err := o.tf.Close(); err != nil {
 		return errors.Wrap(err, "error closing tar")
 	}
 
+	// nolint:wrapcheck
 	return o.w.Close()
 }
 
@@ -124,3 +131,5 @@ func (o *TarOutput) SymlinkExists(ctx context.Context, relativePath string, l fs
 func NewTarOutput(w io.WriteCloser) *TarOutput {
 	return &TarOutput{w, tar.NewWriter(w)}
 }
+
+var _ Output = (*TarOutput)(nil)

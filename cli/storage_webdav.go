@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"os"
 
 	"github.com/alecthomas/kingpin"
 
@@ -14,7 +15,7 @@ type storageWebDAVFlags struct {
 	connectFlat bool
 }
 
-func (c *storageWebDAVFlags) setup(cmd *kingpin.CmdClause) {
+func (c *storageWebDAVFlags) setup(_ storageProviderServices, cmd *kingpin.CmdClause) {
 	cmd.Flag("url", "URL of WebDAV server").Required().StringVar(&c.options.URL)
 	cmd.Flag("flat", "Use flat directory structure").BoolVar(&c.connectFlat)
 	cmd.Flag("webdav-username", "WebDAV username").Envar("KOPIA_WEBDAV_USERNAME").StringVar(&c.options.Username)
@@ -25,7 +26,7 @@ func (c *storageWebDAVFlags) connect(ctx context.Context, isNew bool) (blob.Stor
 	wo := c.options
 
 	if wo.Username != "" && wo.Password == "" {
-		pass, err := askPass("Enter WebDAV password: ")
+		pass, err := askPass(os.Stdout, "Enter WebDAV password: ")
 		if err != nil {
 			return nil, err
 		}
@@ -37,5 +38,6 @@ func (c *storageWebDAVFlags) connect(ctx context.Context, isNew bool) (blob.Stor
 		wo.DirectoryShards = []int{}
 	}
 
+	// nolint:wrapcheck
 	return webdav.New(ctx, &wo)
 }
