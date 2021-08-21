@@ -98,7 +98,7 @@ TOOLS_DIR:=$(SELF_DIR)$(slash).tools
 retry:=$(SELF_DIR)/retry.sh
 
 # tool versions
-GOLANGCI_LINT_VERSION=1.40.1
+GOLANGCI_LINT_VERSION=1.42.0
 NODE_VERSION=14.15.4
 HUGO_VERSION=0.82.0
 GOTESTSUM_VERSION=0.5.3
@@ -231,6 +231,18 @@ $(gotestsum):
 	-$(mkdir) $(TOOLS_DIR)
 	go get gotest.tools/gotestsum
 
+MINIO_MC_PATH=$(TOOLS_DIR)/bin/mc$(exe_suffix)
+
+$(MINIO_MC_PATH):
+	GOBIN=$(TOOLS_DIR)/bin go install github.com/minio/mc@latest
+
+export MINIO_MC_PATH
+
+wwhrd=$(TOOLS_DIR)/bin/wwhrd$(exe_suffix)
+
+$(wwhrd):
+	GOBIN=$(TOOLS_DIR)/bin go install github.com/frapposelli/wwhrd@latest
+
 # goreleaser
 goreleaser_dir=$(TOOLS_DIR)$(slash)goreleaser-$(GORELEASER_VERSION)
 goreleaser=$(goreleaser_dir)$(slash)goreleaser$(exe_suffix)
@@ -277,6 +289,7 @@ export KOPIA_VERSION_NO_PREFIX=$(KOPIA_VERSION:v%=%)
 export REACT_APP_SHORT_VERSION_INFO:=$(KOPIA_VERSION)
 export REACT_APP_FULL_VERSION_INFO:=$(KOPIA_VERSION) built on $(date_full) $(hostname)
 
+KOPIA_BUILD_TAGS=embedhtml
 KOPIA_BUILD_FLAGS=-ldflags "-s -w -X github.com/kopia/kopia/repo.BuildVersion=$(KOPIA_VERSION_NO_PREFIX) -X github.com/kopia/kopia/repo.BuildInfo=$(shell git rev-parse HEAD) -X github.com/kopia/kopia/repo.BuildGitHubRepo=$(GITHUB_REPOSITORY)"
 
 clean-tools:

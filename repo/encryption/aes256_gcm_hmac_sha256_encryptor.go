@@ -9,9 +9,13 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
+
+	"github.com/kopia/kopia/internal/gather"
 )
 
 const aes256GCMHmacSha256Overhead = 28
+
+const aes256KeyDerivationSecretSize = 32
 
 type aes256GCMHmacSha256 struct {
 	hmacPool *sync.Pool
@@ -40,22 +44,22 @@ func (e aes256GCMHmacSha256) aeadForContent(contentID []byte) (cipher.AEAD, erro
 	return cipher.NewGCM(c)
 }
 
-func (e aes256GCMHmacSha256) Decrypt(output, input, contentID []byte) ([]byte, error) {
+func (e aes256GCMHmacSha256) Decrypt(input gather.Bytes, contentID []byte, output *gather.WriteBuffer) error {
 	a, err := e.aeadForContent(contentID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return aeadOpenPrefixedWithNonce(output, a, input, contentID)
+	return aeadOpenPrefixedWithNonce(a, input, contentID, output)
 }
 
-func (e aes256GCMHmacSha256) Encrypt(output, input, contentID []byte) ([]byte, error) {
+func (e aes256GCMHmacSha256) Encrypt(input gather.Bytes, contentID []byte, output *gather.WriteBuffer) error {
 	a, err := e.aeadForContent(contentID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return aeadSealWithRandomNonce(output, a, input, contentID)
+	return aeadSealWithRandomNonce(a, input, contentID, output)
 }
 
 func (e aes256GCMHmacSha256) Overhead() int {
@@ -64,7 +68,7 @@ func (e aes256GCMHmacSha256) Overhead() int {
 
 func init() {
 	Register("AES256-GCM-HMAC-SHA256", "AES-256-GCM using per-content key generated using HMAC-SHA256", false, func(p Parameters) (Encryptor, error) {
-		keyDerivationSecret, err := deriveKey(p, []byte(purposeEncryptionKey), 32)
+		keyDerivationSecret, err := deriveKey(p, []byte(purposeEncryptionKey), aes256KeyDerivationSecretSize)
 		if err != nil {
 			return nil, err
 		}

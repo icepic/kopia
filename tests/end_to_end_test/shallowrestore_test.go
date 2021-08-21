@@ -68,6 +68,51 @@ func TestShallowrestore(t *testing.T) {
 	}
 }
 
+func TestShallowrestoreWithMinSize(t *testing.T) {
+	t.Parallel()
+
+	runner := testenv.NewInProcRunner(t)
+	e := testenv.NewCLITest(t, runner)
+
+	defer e.RunAndExpectSuccess(t, "repo", "disconnect")
+
+	// create some snapshots using different hostname/username
+	e.RunAndExpectSuccess(t, "repo", "create", "filesystem", "--path", e.RepoDir)
+
+	source := filepath.Join(t.TempDir(), "source")
+	require.NoError(t, os.Mkdir(source, 0o755))
+
+	big := filepath.Join(source, "big")
+	testdirtree.MustCreateRandomFile(t, big, testdirtree.DirectoryTreeOptions{
+		MinFileSize: 1000,
+	}, (*testdirtree.DirectoryTreeCounters)(nil))
+
+	little := filepath.Join(source, "little")
+	testdirtree.MustCreateRandomFile(t, little, testdirtree.DirectoryTreeOptions{
+		MaxFileSize: 1000,
+	}, (*testdirtree.DirectoryTreeCounters)(nil))
+
+	e.RunAndExpectSuccess(t, "snapshot", "create", source)
+	sources := clitestutil.ListSnapshotsAndExpectSuccess(t, e)
+
+	if got, want := len(sources), 1; got != want {
+		t.Errorf("unexpected number of sources: %v, want %v in %#v", got, want, sources)
+	}
+
+	snapID := sources[0].Snapshots[0].SnapshotID
+	shallowrestoredir := filepath.Join(t.TempDir(), "shallowrestoredir")
+
+	e.RunAndExpectSuccess(t, "restore", "--shallow=0", "--shallow-minsize=1000", snapID, shallowrestoredir)
+
+	little = filepath.Join(shallowrestoredir, "little")
+	big = filepath.Join(shallowrestoredir, "big")
+
+	require.FileExists(t, little)
+	require.NoFileExists(t, little+localfs.ShallowEntrySuffix)
+	require.FileExists(t, big+localfs.ShallowEntrySuffix)
+	require.NoFileExists(t, big)
+}
+
 func TestShallowFullCycle(t *testing.T) {
 	t.Parallel()
 	runner := testenv.NewInProcRunner(t)
@@ -289,7 +334,7 @@ func deepenSubtreeFile(m *mutatorArgs) {
 // the correct form.
 func deepenOneSubtreeLevel(m *mutatorArgs) {
 	// 1. find a (shallow) directory
-	dirinshallow, _ := findFileDir(m.t, m.shallow)
+	dirinshallow, fileinshallow := findFileDir(m.t, m.shallow)
 	if dirinshallow == "" {
 		m.t.Errorf("can't run deepenOneSubtreeLevel, no shallow directory")
 		return
@@ -299,13 +344,14 @@ func deepenOneSubtreeLevel(m *mutatorArgs) {
 	m.t.Log("relpath", relpath)
 
 	// 2. shallow restore it into the shallow tree
-	m.e.RunAndExpectSuccess(m.t, "restore", dirinshallow)
+	m.e.RunAndExpectSuccess(m.t, "restore", dirinshallow, fileinshallow)
 
 	// 2.5 verify that the restored subtree is correctly real and shallow
 	origpath := filepath.Join(m.original, relpath)
 
 	// depth is 1 because we've expanded one level down.
 	compareShallowToOriginalDir(m.t, m.rdc, localfs.TrimShallowSuffix(origpath), localfs.TrimShallowSuffix(dirinshallow), 1)
+	compareShallowToOriginalDir(m.t, m.rdc, localfs.TrimShallowSuffix(origpath), localfs.TrimShallowSuffix(fileinshallow), 1)
 
 	// 3. Original shouldn't require any changes.
 } // nolint:wsl
@@ -523,7 +569,7 @@ const (
 	// d1 + kSUBFILE is the DirEntry placeholder for placeholder directory d1.kopia-entry.
 	sUBFILE = string(filepath.Separator) + localfs.ShallowEntrySuffix
 
-	dirMode = 0700
+	dirMode = 0o700
 )
 
 // getShallowDirEntry reads the DirEntry in the placeholder associated
@@ -744,6 +790,7 @@ func getShallowInfo(t *testing.T, srp string) (string, os.FileInfo) {
 	paths := make([]string, ENTRYTYPES)
 
 	v := -1
+
 	for i, s := range []string{"", localfs.ShallowEntrySuffix, dIRPH} { // nolint(wsl)
 		paths[i] = srp + s
 		shallowinfos[i], errors[i] = os.Lstat(paths[i])
@@ -756,6 +803,7 @@ func getShallowInfo(t *testing.T, srp string) (string, os.FileInfo) {
 	// Always there should be ENTRYTYPES-1 errors (i.e. one and only one of
 	// the file paths should exist.)
 	errcount := 0
+
 	for _, e := range errors { // nolint(wsl)
 		if e != nil {
 			errcount++

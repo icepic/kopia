@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/logging"
 )
@@ -30,12 +31,12 @@ type FaultyStorage struct {
 }
 
 // GetBlob implements blob.Storage.
-func (s *FaultyStorage) GetBlob(ctx context.Context, id blob.ID, offset, length int64) ([]byte, error) {
+func (s *FaultyStorage) GetBlob(ctx context.Context, id blob.ID, offset, length int64, output *gather.WriteBuffer) error {
 	if err := s.getNextFault(ctx, "GetBlob", id, offset, length); err != nil {
-		return nil, err
+		return err
 	}
 
-	return s.Base.GetBlob(ctx, id, offset, length)
+	return s.Base.GetBlob(ctx, id, offset, length, output)
 }
 
 // GetMetadata implements blob.Storage.
@@ -107,13 +108,21 @@ func (s *FaultyStorage) DisplayName() string {
 	return s.Base.DisplayName()
 }
 
+// FlushCaches implements blob.Storage.
+func (s *FaultyStorage) FlushCaches(ctx context.Context) error {
+	if err := s.getNextFault(ctx, "FlushCaches"); err != nil {
+		return err
+	}
+
+	return s.Base.FlushCaches(ctx)
+}
+
 func (s *FaultyStorage) getNextFault(ctx context.Context, method string, args ...interface{}) error {
 	s.mu.Lock()
 
 	faults := s.Faults[method]
 	if len(faults) == 0 {
 		s.mu.Unlock()
-		log(ctx).Debugf("no faults for %v %v", method, args)
 
 		return nil
 	}

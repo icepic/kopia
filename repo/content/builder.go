@@ -2,12 +2,15 @@ package content
 
 import (
 	"crypto/rand"
+	"hash/fnv"
 	"io"
 	"runtime"
 	"sort"
 	"sync"
 
 	"github.com/pkg/errors"
+
+	"github.com/kopia/kopia/internal/gather"
 )
 
 const randomSuffixSize = 32 // number of random bytes to append at the end to make the index blob unique
@@ -34,7 +37,7 @@ func (b packIndexBuilder) clone() packIndexBuilder {
 func (b packIndexBuilder) Add(i Info) {
 	cid := i.GetContentID()
 
-	if old, ok := b[cid]; !ok || i.GetTimestampSeconds() >= old.GetTimestampSeconds() {
+	if contentInfoGreaterThan(i, b[cid]) {
 		b[cid] = i
 	}
 }
@@ -139,4 +142,74 @@ func (b packIndexBuilder) BuildStable(output io.Writer, version int) error {
 	default:
 		return errors.Errorf("unsupported index version: %v", version)
 	}
+}
+
+func (b packIndexBuilder) shard(maxShardSize int) []packIndexBuilder {
+	numShards := (len(b) + maxShardSize - 1) / maxShardSize
+	if numShards <= 1 {
+		return []packIndexBuilder{b}
+	}
+
+	result := make([]packIndexBuilder, numShards)
+	for i := range result {
+		result[i] = make(packIndexBuilder)
+	}
+
+	for k, v := range b {
+		h := fnv.New32a()
+		io.WriteString(h, string(k)) // nolint:errcheck
+
+		shard := h.Sum32() % uint32(numShards)
+
+		result[shard][k] = v
+	}
+
+	return result
+}
+
+func (b packIndexBuilder) buildShards(indexVersion int, stable bool, shardSize int) ([]gather.Bytes, func(), error) {
+	if shardSize == 0 {
+		return nil, nil, errors.Errorf("invalid shard size")
+	}
+
+	var (
+		shardedBuilders = b.shard(shardSize)
+		dataShardsBuf   []*gather.WriteBuffer
+		dataShards      []gather.Bytes
+		randomSuffix    [32]byte
+	)
+
+	closeShards := func() {
+		for _, ds := range dataShardsBuf {
+			ds.Close()
+		}
+	}
+
+	for _, s := range shardedBuilders {
+		buf := gather.NewWriteBuffer()
+
+		if err := s.BuildStable(buf, indexVersion); err != nil {
+			closeShards()
+
+			return nil, nil, errors.Wrap(err, "error building index shard")
+		}
+
+		if !stable {
+			if _, err := rand.Read(randomSuffix[:]); err != nil {
+				closeShards()
+
+				return nil, nil, errors.Wrap(err, "error getting random bytes for suffix")
+			}
+
+			if _, err := buf.Write(randomSuffix[:]); err != nil {
+				closeShards()
+
+				return nil, nil, errors.Wrap(err, "error writing extra random suffix to ensure indexes are always globally unique")
+			}
+		}
+
+		dataShards = append(dataShards, buf.Bytes())
+	}
+
+	return dataShards, closeShards, nil
 }

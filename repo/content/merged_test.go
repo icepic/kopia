@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
+
+	"github.com/kopia/kopia/repo/blob"
 )
 
 func TestMerged(t *testing.T) {
@@ -15,18 +18,14 @@ func TestMerged(t *testing.T) {
 		&InfoStruct{ContentID: "z010203", TimestampSeconds: 1, PackBlobID: "xx", PackOffset: 111},
 		&InfoStruct{ContentID: "de1e1e", TimestampSeconds: 4, PackBlobID: "xx", PackOffset: 111},
 	)
-	if err != nil {
-		t.Fatalf("can't create index: %v", err)
-	}
+	require.NoError(t, err)
 
 	i2, err := indexWithItems(
 		&InfoStruct{ContentID: "aabbcc", TimestampSeconds: 3, PackBlobID: "yy", PackOffset: 33},
 		&InfoStruct{ContentID: "xaabbcc", TimestampSeconds: 1, PackBlobID: "xx", PackOffset: 111},
 		&InfoStruct{ContentID: "de1e1e", TimestampSeconds: 4, PackBlobID: "xx", PackOffset: 222, Deleted: true},
 	)
-	if err != nil {
-		t.Fatalf("can't create index: %v", err)
-	}
+	require.NoError(t, err)
 
 	i3, err := indexWithItems(
 		&InfoStruct{ContentID: "aabbcc", TimestampSeconds: 2, PackBlobID: "zz", PackOffset: 22},
@@ -34,9 +33,7 @@ func TestMerged(t *testing.T) {
 		&InfoStruct{ContentID: "k010203", TimestampSeconds: 1, PackBlobID: "xx", PackOffset: 111},
 		&InfoStruct{ContentID: "k020304", TimestampSeconds: 1, PackBlobID: "xx", PackOffset: 111},
 	)
-	if err != nil {
-		t.Fatalf("can't create index: %v", err)
-	}
+	require.NoError(t, err)
 
 	m := mergedIndex{i1, i2, i3}
 
@@ -49,7 +46,7 @@ func TestMerged(t *testing.T) {
 		t.Errorf("invalid pack offset %v, wanted %v", got, want)
 	}
 
-	assertNoError(t, m.Iterate(AllIDs, func(i Info) error {
+	require.NoError(t, m.Iterate(AllIDs, func(i Info) error {
 		if i.GetContentID() == "de1e1e" {
 			if i.GetDeleted() {
 				t.Errorf("iteration preferred deleted content over non-deleted")
@@ -133,12 +130,70 @@ func TestMerged(t *testing.T) {
 	}
 }
 
+func TestMergedIndexIsConsistent(t *testing.T) {
+	i1, err := indexWithItems(
+		&InfoStruct{ContentID: "aabbcc", TimestampSeconds: 1, PackBlobID: "xx", PackOffset: 11},
+		&InfoStruct{ContentID: "bbccdd", TimestampSeconds: 1, PackBlobID: "xx", PackOffset: 11},
+		&InfoStruct{ContentID: "ccddee", TimestampSeconds: 1, PackBlobID: "ff", PackOffset: 11, Deleted: true},
+	)
+	require.NoError(t, err)
+
+	i2, err := indexWithItems(
+		&InfoStruct{ContentID: "aabbcc", TimestampSeconds: 1, PackBlobID: "yy", PackOffset: 33},
+		&InfoStruct{ContentID: "bbccdd", TimestampSeconds: 1, PackBlobID: "yy", PackOffset: 11, Deleted: true},
+		&InfoStruct{ContentID: "ccddee", TimestampSeconds: 1, PackBlobID: "gg", PackOffset: 11, Deleted: true},
+	)
+	require.NoError(t, err)
+
+	i3, err := indexWithItems(
+		&InfoStruct{ContentID: "aabbcc", TimestampSeconds: 1, PackBlobID: "zz", PackOffset: 22},
+		&InfoStruct{ContentID: "bbccdd", TimestampSeconds: 1, PackBlobID: "zz", PackOffset: 11, Deleted: true},
+		&InfoStruct{ContentID: "ccddee", TimestampSeconds: 1, PackBlobID: "hh", PackOffset: 11, Deleted: true},
+	)
+	require.NoError(t, err)
+
+	cases := []mergedIndex{
+		{i1, i2, i3},
+		{i1, i3, i2},
+		{i2, i1, i3},
+		{i2, i3, i1},
+		{i3, i1, i2},
+		{i3, i2, i1},
+	}
+
+	for _, m := range cases {
+		i, err := m.GetInfo("aabbcc")
+		if err != nil || i == nil {
+			t.Fatalf("unable to get info: %v", err)
+		}
+
+		// all things being equal, highest pack blob ID wins
+		require.Equal(t, blob.ID("zz"), i.GetPackBlobID())
+
+		i, err = m.GetInfo("bbccdd")
+		if err != nil || i == nil {
+			t.Fatalf("unable to get info: %v", err)
+		}
+
+		// given identical timestamps, non-deleted wins.
+		require.Equal(t, blob.ID("xx"), i.GetPackBlobID())
+
+		i, err = m.GetInfo("ccddee")
+		if err != nil || i == nil {
+			t.Fatalf("unable to get info: %v", err)
+		}
+
+		// given identical timestamps and all deleted, highest pack blob ID wins.
+		require.Equal(t, blob.ID("hh"), i.GetPackBlobID())
+	}
+}
+
 func iterateIDRange(t *testing.T, m packIndex, r IDRange) []ID {
 	t.Helper()
 
 	var inOrder []ID
 
-	assertNoError(t, m.Iterate(r, func(i Info) error {
+	require.NoError(t, m.Iterate(r, func(i Info) error {
 		inOrder = append(inOrder, i.GetContentID())
 		return nil
 	}))

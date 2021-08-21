@@ -6,6 +6,7 @@ import (
 
 	atunits "github.com/alecthomas/units"
 
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/internal/timetrack"
 	"github.com/kopia/kopia/internal/units"
 	"github.com/kopia/kopia/repo/content"
@@ -43,21 +44,18 @@ func (c *commandBenchmarkCrypto) run(ctx context.Context) error {
 
 	data := make([]byte, c.blockSize)
 
-	const (
-		maxEncryptionOverhead = 1024
-	)
-
 	var hashOutput [hashing.MaxHashSize]byte
 
-	encryptOutput := make([]byte, len(data)+maxEncryptionOverhead)
+	var encryptOutput gather.WriteBuffer
+	defer encryptOutput.Close()
 
 	for _, ha := range hashing.SupportedAlgorithms() {
 		for _, ea := range encryption.SupportedAlgorithms(c.deprecatedAlgorithms) {
 			cr, err := content.CreateCrypter(&content.FormattingOptions{
 				Encryption: ea,
 				Hash:       ha,
-				MasterKey:  make([]byte, 32),
-				HMACSecret: make([]byte, 32),
+				MasterKey:  make([]byte, 32), // nolint:gomnd
+				HMACSecret: make([]byte, 32), // nolint:gomnd
 			})
 			if err != nil {
 				continue
@@ -65,13 +63,14 @@ func (c *commandBenchmarkCrypto) run(ctx context.Context) error {
 
 			log(ctx).Infof("Benchmarking hash '%v' and encryption '%v'... (%v x %v bytes)", ha, ea, c.repeat, len(data))
 
+			input := gather.FromSlice(data)
 			tt := timetrack.Start()
 
 			hashCount := c.repeat
 
 			for i := 0; i < hashCount; i++ {
-				contentID := cr.HashFunction(hashOutput[:0], data)
-				if _, encerr := cr.Encryptor.Encrypt(encryptOutput[:0], data, contentID); encerr != nil {
+				contentID := cr.HashFunction(hashOutput[:0], input)
+				if encerr := cr.Encryptor.Encrypt(input, contentID, &encryptOutput); encerr != nil {
 					log(ctx).Errorf("encryption failed: %v", encerr)
 					break
 				}

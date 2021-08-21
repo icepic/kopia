@@ -36,6 +36,7 @@ func (c *storageFilesystemFlags) setup(_ storageProviderServices, cmd *kingpin.C
 	cmd.Flag("file-mode", "File mode for newly created files (0600)").PlaceHolder("MODE").StringVar(&c.connectFileMode)
 	cmd.Flag("dir-mode", "Mode of newly directory files (0700)").PlaceHolder("MODE").StringVar(&c.connectDirMode)
 	cmd.Flag("flat", "Use flat directory structure").BoolVar(&c.connectFlat)
+	cmd.Flag("list-parallelism", "Set list parallelism").Hidden().IntVar(&c.options.ListParallelism)
 }
 
 func (c *storageFilesystemFlags) connect(ctx context.Context, isNew bool) (blob.Storage, error) {
@@ -48,10 +49,12 @@ func (c *storageFilesystemFlags) connect(ctx context.Context, isNew bool) (blob.
 	}
 
 	if v := c.connectOwnerUID; v != "" {
+		// nolint:gomnd
 		fso.FileUID = getIntPtrValue(v, 10)
 	}
 
 	if v := c.connectOwnerGID; v != "" {
+		// nolint:gomnd
 		fso.FileGID = getIntPtrValue(v, 10)
 	}
 
@@ -75,6 +78,7 @@ func (c *storageFilesystemFlags) connect(ctx context.Context, isNew bool) (blob.
 }
 
 func getIntPtrValue(value string, base int) *int {
+	// nolint:gomnd
 	if int64Val, err := strconv.ParseInt(value, base, 32); err == nil {
 		intVal := int(int64Val)
 		return &intVal
@@ -84,6 +88,7 @@ func getIntPtrValue(value string, base int) *int {
 }
 
 func getFileModeValue(value string, def os.FileMode) os.FileMode {
+	// nolint:gomnd
 	if uint32Val, err := strconv.ParseUint(value, 8, 32); err == nil {
 		return os.FileMode(uint32Val)
 	}

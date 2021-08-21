@@ -17,6 +17,8 @@ import (
 	"github.com/kopia/kopia/internal/blobtesting"
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/internal/faketime"
+	"github.com/kopia/kopia/internal/gather"
+	"github.com/kopia/kopia/internal/ownwrites"
 	"github.com/kopia/kopia/internal/testlogging"
 	"github.com/kopia/kopia/internal/testutil"
 	"github.com/kopia/kopia/repo/blob"
@@ -417,7 +419,7 @@ type fakeContentIndexEntry struct {
 	Deleted bool
 }
 
-func verifyFakeContentsWritten(ctx context.Context, t *testing.T, m indexBlobManager, numWritten int, contentPrefix string, deletedContents map[string]bool) error {
+func verifyFakeContentsWritten(ctx context.Context, t *testing.T, m *indexBlobManagerV0, numWritten int, contentPrefix string, deletedContents map[string]bool) error {
 	t.Helper()
 
 	if numWritten == 0 {
@@ -451,7 +453,7 @@ func verifyFakeContentsWritten(ctx context.Context, t *testing.T, m indexBlobMan
 	return nil
 }
 
-func fakeCompaction(ctx context.Context, t *testing.T, m indexBlobManager, dropDeleted bool) error {
+func fakeCompaction(ctx context.Context, t *testing.T, m *indexBlobManagerV0, dropDeleted bool) error {
 	t.Helper()
 
 	t.Logf("fakeCompaction(dropDeleted=%v)", dropDeleted)
@@ -489,15 +491,10 @@ func fakeCompaction(ctx context.Context, t *testing.T, m indexBlobManager, dropD
 
 	var (
 		inputs  []blob.Metadata
-		outputs = []blob.Metadata{outputBM}
+		outputs = outputBM
 	)
 
 	for _, bi := range allBlobs {
-		if bi.BlobID == outputBM.BlobID {
-			// no compaction, output is the same as one of the inputs
-			return nil
-		}
-
 		inputs = append(inputs, bi.Metadata)
 	}
 
@@ -512,7 +509,7 @@ func fakeContentID(prefix string, n int) string {
 	return fmt.Sprintf("%v-%06v", prefix, n)
 }
 
-func deleteFakeContents(ctx context.Context, t *testing.T, m indexBlobManager, prefix string, numWritten int, deleted map[string]bool, timeFunc func() time.Time) error {
+func deleteFakeContents(ctx context.Context, t *testing.T, m *indexBlobManagerV0, prefix string, numWritten int, deleted map[string]bool, timeFunc func() time.Time) error {
 	t.Helper()
 
 	if numWritten == 0 {
@@ -549,7 +546,7 @@ func deleteFakeContents(ctx context.Context, t *testing.T, m indexBlobManager, p
 	return err
 }
 
-func undeleteFakeContents(ctx context.Context, t *testing.T, m indexBlobManager, deleted map[string]bool, timeFunc func() time.Time) error {
+func undeleteFakeContents(ctx context.Context, t *testing.T, m *indexBlobManagerV0, deleted map[string]bool, timeFunc func() time.Time) error {
 	t.Helper()
 
 	if len(deleted) == 0 {
@@ -587,7 +584,7 @@ func undeleteFakeContents(ctx context.Context, t *testing.T, m indexBlobManager,
 	return err
 }
 
-func writeFakeContents(ctx context.Context, t *testing.T, m indexBlobManager, prefix string, count int, numWritten *int, timeFunc func() time.Time) error {
+func writeFakeContents(ctx context.Context, t *testing.T, m *indexBlobManagerV0, prefix string, count int, numWritten *int, timeFunc func() time.Time) error {
 	t.Helper()
 
 	t.Logf("writeFakeContents()")
@@ -614,32 +611,28 @@ type fakeIndexData struct {
 	Entries  map[string]fakeContentIndexEntry
 }
 
-func writeFakeIndex(ctx context.Context, t *testing.T, m indexBlobManager, ndx map[string]fakeContentIndexEntry) (blob.Metadata, error) {
+func writeFakeIndex(ctx context.Context, t *testing.T, m *indexBlobManagerV0, ndx map[string]fakeContentIndexEntry) ([]blob.Metadata, error) {
 	t.Helper()
 
-	j, err := json.Marshal(fakeIndexData{
+	var tmp gather.WriteBuffer
+	defer tmp.Close()
+
+	require.NoError(t, json.NewEncoder(&tmp).Encode(fakeIndexData{
 		RandomID: rand.Int63(),
 		Entries:  ndx,
-	})
+	}))
+
+	bms, err := m.writeIndexBlobs(ctx, []gather.Bytes{tmp.Bytes()}, "")
 	if err != nil {
-		return blob.Metadata{}, errors.Wrap(err, "json error")
+		return nil, errors.Wrap(err, "error writing blob")
 	}
 
-	bm, err := m.writeIndexBlob(ctx, j, "")
-	if err != nil {
-		return blob.Metadata{}, errors.Wrap(err, "error writing blob")
-	}
-
-	for k, v := range ndx {
-		t.Logf("wrote content %v %v in blob %v", k, v, bm)
-	}
-
-	return bm, nil
+	return bms, nil
 }
 
 var errGetAllFakeContentsRetry = errors.New("retry")
 
-func getAllFakeContents(ctx context.Context, t *testing.T, m indexBlobManager) (map[string]fakeContentIndexEntry, []IndexBlobInfo, error) {
+func getAllFakeContents(ctx context.Context, t *testing.T, m *indexBlobManagerV0) (map[string]fakeContentIndexEntry, []IndexBlobInfo, error) {
 	t.Helper()
 
 	allContents, allBlobs, err := getAllFakeContentsInternal(ctx, t, m)
@@ -651,10 +644,10 @@ func getAllFakeContents(ctx context.Context, t *testing.T, m indexBlobManager) (
 	return allContents, allBlobs, err
 }
 
-func getAllFakeContentsInternal(ctx context.Context, t *testing.T, m indexBlobManager) (map[string]fakeContentIndexEntry, []IndexBlobInfo, error) {
+func getAllFakeContentsInternal(ctx context.Context, t *testing.T, m *indexBlobManagerV0) (map[string]fakeContentIndexEntry, []IndexBlobInfo, error) {
 	t.Helper()
 
-	blobs, err := m.listActiveIndexBlobs(ctx)
+	blobs, _, err := m.listActiveIndexBlobs(ctx)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "error listing index blobs")
 	}
@@ -663,8 +656,11 @@ func getAllFakeContentsInternal(ctx context.Context, t *testing.T, m indexBlobMa
 
 	allContents := map[string]fakeContentIndexEntry{}
 
+	var bb gather.WriteBuffer
+	defer bb.Close()
+
 	for _, bi := range blobs {
-		bb, err := m.getIndexBlob(ctx, bi.BlobID)
+		err := m.getIndexBlob(ctx, bi.BlobID, &bb)
 		if errors.Is(err, blob.ErrBlobNotFound) {
 			return nil, nil, errGetAllFakeContentsRetry
 		}
@@ -675,8 +671,8 @@ func getAllFakeContentsInternal(ctx context.Context, t *testing.T, m indexBlobMa
 
 		var indexData fakeIndexData
 
-		if err := json.Unmarshal(bb, &indexData); err != nil {
-			t.Logf("invalid JSON %v: %v", string(bb), err)
+		if err := json.NewDecoder(bb.Bytes().Reader()).Decode(&indexData); err != nil {
+			t.Logf("invalid JSON %v: %v", string(bb.ToByteSlice()), err)
 			return nil, nil, errors.Wrap(err, "error unmarshaling")
 		}
 
@@ -714,7 +710,7 @@ func keysWithPrefix(data blobtesting.DataMap, prefix blob.ID) []blob.ID {
 	return res
 }
 
-func mustRegisterCompaction(t *testing.T, m indexBlobManager, inputs, outputs []blob.Metadata) {
+func mustRegisterCompaction(t *testing.T, m *indexBlobManagerV0, inputs, outputs []blob.Metadata) {
 	t.Helper()
 
 	t.Logf("compacting %v to %v", inputs, outputs)
@@ -725,20 +721,20 @@ func mustRegisterCompaction(t *testing.T, m indexBlobManager, inputs, outputs []
 	}
 }
 
-func mustWriteIndexBlob(t *testing.T, m indexBlobManager, data string) blob.Metadata {
+func mustWriteIndexBlob(t *testing.T, m *indexBlobManagerV0, data string) blob.Metadata {
 	t.Helper()
 
 	t.Logf("writing index blob %q", data)
 
-	blobMD, err := m.writeIndexBlob(testlogging.Context(t), []byte(data), "")
+	blobMDs, err := m.writeIndexBlobs(testlogging.Context(t), []gather.Bytes{gather.FromSlice([]byte(data))}, "")
 	if err != nil {
 		t.Fatalf("failed to write index blob: %v", err)
 	}
 
-	return blobMD
+	return blobMDs[0]
 }
 
-func assertIndexBlobList(t *testing.T, m indexBlobManager, wantMD ...blob.Metadata) {
+func assertIndexBlobList(t *testing.T, m *indexBlobManagerV0, wantMD ...blob.Metadata) {
 	t.Helper()
 
 	var want []blob.ID
@@ -746,7 +742,7 @@ func assertIndexBlobList(t *testing.T, m indexBlobManager, wantMD ...blob.Metada
 		want = append(want, it.BlobID)
 	}
 
-	l, err := m.listActiveIndexBlobs(testlogging.Context(t))
+	l, _, err := m.listActiveIndexBlobs(testlogging.Context(t))
 	if err != nil {
 		t.Fatalf("failed to list index blobs: %v", err)
 	}
@@ -761,7 +757,7 @@ func assertIndexBlobList(t *testing.T, m indexBlobManager, wantMD ...blob.Metada
 	require.ElementsMatch(t, got, want)
 }
 
-func newIndexBlobManagerForTesting(t *testing.T, st blob.Storage, localTimeNow func() time.Time) indexBlobManager {
+func newIndexBlobManagerForTesting(t *testing.T, st blob.Storage, localTimeNow func() time.Time) *indexBlobManagerV0 {
 	t.Helper()
 
 	p := &FormattingOptions{
@@ -779,26 +775,30 @@ func newIndexBlobManagerForTesting(t *testing.T, st blob.Storage, localTimeNow f
 		t.Fatalf("unable to create hash: %v", err)
 	}
 
-	lc, err := newListCache(st, &CachingOptions{}, repologging.Printf(t.Logf)("test"))
-	if err != nil {
-		t.Fatalf("unable to create list cache: %v", err)
-	}
+	st = ownwrites.NewWrapper(
+		st,
+		blobtesting.NewMapStorage(blobtesting.DataMap{}, nil, nil),
+		[]blob.ID{IndexBlobPrefix, compactionLogBlobPrefix, cleanupBlobPrefix},
+		15*time.Minute,
+	)
 
-	m := &indexBlobManagerImpl{
+	log := repologging.Printf(t.Logf)("test")
+
+	m := &indexBlobManagerV0{
 		st: st,
-		ownWritesCache: &persistentOwnWritesCache{
-			blobtesting.NewMapStorage(blobtesting.DataMap{}, nil, localTimeNow),
-			localTimeNow,
-			lc.log,
+		enc: &encryptedBlobMgr{
+			st:             st,
+			indexBlobCache: passthroughContentCache{st},
+			crypter: &Crypter{
+				HashFunction: hf,
+				Encryptor:    enc,
+			},
+			log: log,
 		},
-		indexBlobCache: passthroughContentCache{st},
-		crypter: &Crypter{
-			HashFunction: hf,
-			Encryptor:    enc,
-		},
-		listCache: lc,
-		timeNow:   localTimeNow,
-		log:       repologging.Printf(t.Logf)("test"),
+		timeNow:      localTimeNow,
+		maxPackSize:  20 << 20,
+		indexVersion: 1,
+		log:          log,
 	}
 
 	return m

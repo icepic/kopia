@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -15,6 +16,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/studio-b12/gowebdav"
 
+	"github.com/kopia/kopia/internal/gather"
+	"github.com/kopia/kopia/internal/iocopy"
 	"github.com/kopia/kopia/internal/retry"
 	"github.com/kopia/kopia/internal/tlsutil"
 	"github.com/kopia/kopia/repo/blob"
@@ -46,18 +49,36 @@ type davStorageImpl struct {
 	cli *gowebdav.Client
 }
 
-func (d *davStorageImpl) GetBlobFromPath(ctx context.Context, dirPath, path string, offset, length int64) ([]byte, error) {
-	data, err := d.cli.Read(path)
-	if err != nil {
-		return nil, d.translateError(err)
+func (d *davStorageImpl) GetBlobFromPath(ctx context.Context, dirPath, path string, offset, length int64, output *gather.WriteBuffer) error {
+	output.Reset()
+
+	if offset < 0 {
+		return blob.ErrInvalidRange
 	}
 
-	if int(offset) > len(data) || offset < 0 {
-		return nil, errors.Wrap(blob.ErrInvalidRange, "invalid offset")
+	s, err := d.cli.ReadStream(path)
+	if err != nil {
+		return d.translateError(err)
+	}
+
+	defer s.Close() // nolint:errcheck
+
+	if length < 0 {
+		// nolint:wrapcheck
+		return iocopy.JustCopy(output, s)
+	}
+
+	// this is horrible, but gowebdav does not support seeking (yet).
+	if err := iocopy.JustCopy(io.Discard, io.LimitReader(s, offset)); err != nil {
+		return errors.Wrap(err, "error discarding data from stream")
+	}
+
+	if err := iocopy.JustCopy(output, io.LimitReader(s, length)); err != nil {
+		return errors.Wrap(err, "error reading stream")
 	}
 
 	// nolint:wrapcheck
-	return blob.EnsureLengthAndTruncate(data[offset:], length)
+	return blob.EnsureLengthExactly(output.Length(), length)
 }
 
 func (d *davStorageImpl) GetMetadataFromPath(ctx context.Context, dirPath, path string) (blob.Metadata, error) {
@@ -111,7 +132,13 @@ func (d *davStorageImpl) ReadDir(ctx context.Context, dir string) ([]os.FileInfo
 }
 
 func (d *davStorageImpl) PutBlobInPath(ctx context.Context, dirPath, filePath string, data blob.Bytes) error {
-	tmpPath := fmt.Sprintf("%v-%v", filePath, rand.Int63()) //nolint:gosec
+	var writePath string
+
+	if d.Options.AtomicWrites {
+		writePath = filePath
+	} else {
+		writePath = fmt.Sprintf("%v-%v", filePath, rand.Int63()) //nolint:gosec
+	}
 
 	var buf bytes.Buffer
 
@@ -125,15 +152,19 @@ func (d *davStorageImpl) PutBlobInPath(ctx context.Context, dirPath, filePath st
 
 		for {
 			// nolint:wrapcheck
-			err := d.translateError(d.cli.Write(tmpPath, b, defaultFilePerm))
+			err := d.translateError(d.cli.Write(writePath, b, defaultFilePerm))
 			if err == nil {
+				if d.Options.AtomicWrites {
+					return nil
+				}
+
 				// nolint:wrapcheck
-				return d.cli.Rename(tmpPath, filePath, true)
+				return d.cli.Rename(writePath, filePath, true)
 			}
 
 			// An error above may indicate that the directory doesn't exist.
 			// Attempt to create required directories and try again, if successful.
-			if !mkdirAttempted {
+			if !mkdirAttempted && dirPath != "" {
 				mkdirAttempted = true
 
 				if mkdirErr := d.cli.MkdirAll(dirPath, defaultDirPerm); mkdirErr == nil {
@@ -177,6 +208,10 @@ func (d *davStorage) Close(ctx context.Context) error {
 	return nil
 }
 
+func (d *davStorage) FlushCaches(ctx context.Context) error {
+	return nil
+}
+
 func isRetriable(err error) bool {
 	var pe *os.PathError
 
@@ -210,9 +245,10 @@ func New(ctx context.Context, opts *Options) (blob.Storage, error) {
 				Options: *opts,
 				cli:     cli,
 			},
-			RootPath: "",
-			Suffix:   fsStorageChunkSuffix,
-			Shards:   opts.shards(),
+			RootPath:        "",
+			Suffix:          fsStorageChunkSuffix,
+			Shards:          opts.shards(),
+			ListParallelism: opts.ListParallelism,
 		},
 	})
 

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/foomo/htpasswd"
@@ -41,6 +42,19 @@ type rcloneStorage struct {
 
 	cmd          *exec.Cmd // running rclone
 	temporaryDir string
+
+	allTransfersComplete *int32 // set to 1 when rclone process emits "Transferred:*100%"
+	changeCount          *int32 // set to 1 when we had any writes
+}
+
+func (r *rcloneStorage) PutBlob(ctx context.Context, b blob.ID, data blob.Bytes) error {
+	err := r.Storage.PutBlob(ctx, b, data)
+	if err == nil {
+		atomic.StoreInt32(r.changeCount, 1)
+		return nil
+	}
+
+	return errors.Wrap(err, "error writing blob using WebDAV")
 }
 
 func (r *rcloneStorage) ConnectionInfo() blob.ConnectionInfo {
@@ -50,7 +64,27 @@ func (r *rcloneStorage) ConnectionInfo() blob.ConnectionInfo {
 	}
 }
 
+func (r *rcloneStorage) waitForTransfersToEnd(ctx context.Context) {
+	if atomic.LoadInt32(r.changeCount) == 0 {
+		log(ctx).Debugf("no writes in this session, no need to wait")
+		return
+	}
+
+	log(ctx).Debugf("waiting for background rclone transfers to complete...")
+
+	for atomic.LoadInt32(r.allTransfersComplete) == 0 {
+		log(ctx).Debugf("still waiting for background rclone transfers to complete...")
+		time.Sleep(1 * time.Second)
+	}
+
+	log(ctx).Debugf("all background rclone transfers have completed.")
+}
+
 func (r *rcloneStorage) Close(ctx context.Context) error {
+	if !r.Options.NoWaitForTransfers {
+		r.waitForTransfersToEnd(ctx)
+	}
+
 	if r.Storage != nil {
 		if err := r.Storage.Close(ctx); err != nil {
 			return errors.Wrap(err, "error closing webdav connection")
@@ -77,7 +111,25 @@ func (r *rcloneStorage) DisplayName() string {
 	return "RClone " + r.Options.RemotePath
 }
 
-func runRCloneAndWaitForServerAddress(ctx context.Context, c *exec.Cmd, startupTimeout time.Duration) (string, error) {
+func (r *rcloneStorage) processStderrStatus(ctx context.Context, statsMarker string, s *bufio.Scanner) {
+	for s.Scan() {
+		l := s.Text()
+
+		if r.Debug {
+			log(ctx).Debugf("[RCLONE] %v", l)
+		}
+
+		if strings.Contains(l, statsMarker) {
+			if strings.Contains(l, " 100%,") || strings.Contains(l, ", -,") {
+				atomic.StoreInt32(r.allTransfersComplete, 1)
+			} else {
+				atomic.StoreInt32(r.allTransfersComplete, 0)
+			}
+		}
+	}
+}
+
+func (r *rcloneStorage) runRCloneAndWaitForServerAddress(ctx context.Context, c *exec.Cmd, statsMarker string, startupTimeout time.Duration) (string, error) {
 	rcloneAddressChan := make(chan string)
 	rcloneErrChan := make(chan error)
 
@@ -107,8 +159,7 @@ func runRCloneAndWaitForServerAddress(ctx context.Context, c *exec.Cmd, startupT
 				if p := strings.Index(l, "https://"); p >= 0 {
 					rcloneAddressChan <- l[p:]
 
-					// consume the remainder of stderr to avoid blocking rclone
-					go ioutil.ReadAll(stderr) //nolint:errcheck
+					go r.processStderrStatus(ctx, statsMarker, s)
 
 					return
 				}
@@ -145,6 +196,9 @@ func New(ctx context.Context, opt *Options) (blob.Storage, error) {
 	r := &rcloneStorage{
 		Options:      *opt,
 		temporaryDir: td,
+
+		changeCount:          new(int32),
+		allTransfersComplete: new(int32),
 	}
 
 	// TLS key for rclone webdav server.
@@ -164,6 +218,7 @@ func New(ctx context.Context, opt *Options) (blob.Storage, error) {
 	}()
 
 	// write TLS files.
+	// nolint:gomnd
 	cert, key, err := tlsutil.GenerateServerCertificate(ctx, 2048, 365*24*time.Hour, []string{"127.0.0.1"})
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to generate server certificate")
@@ -190,18 +245,24 @@ func New(ctx context.Context, opt *Options) (blob.Storage, error) {
 		rcloneExe = opt.RCloneExe
 	}
 
+	statsMarker := "STATS:KOPIA"
+
 	arguments := append([]string{
-		"-vv",
+		"-v",
 		"serve", "webdav", opt.RemotePath,
 		"--addr", "127.0.0.1:0", // allocate random port,
 		"--cert", temporaryCertPath,
 		"--key", temporaryKeyPath,
 		"--htpasswd", temporaryHtpassword,
+		"--stats", "1s",
+		"--stats-one-line",
+		"--stats-one-line-date-format=" + statsMarker,
 	}, opt.RCloneArgs...)
 
 	if opt.EmbeddedConfig != "" {
 		tmpConfigFile := filepath.Join(r.temporaryDir, "rclone.conf")
 
+		// nolint:gomnd
 		if err = ioutil.WriteFile(tmpConfigFile, []byte(opt.EmbeddedConfig), 0o600); err != nil {
 			return nil, errors.Wrap(err, "unable to write config file")
 		}
@@ -217,7 +278,7 @@ func New(ctx context.Context, opt *Options) (blob.Storage, error) {
 		startupTimeout = time.Duration(opt.StartupTimeout) * time.Second
 	}
 
-	rcloneAddr, err := runRCloneAndWaitForServerAddress(ctx, r.cmd, startupTimeout)
+	rcloneAddr, err := r.runRCloneAndWaitForServerAddress(ctx, r.cmd, statsMarker, startupTimeout)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to start rclone")
 	}
@@ -231,6 +292,8 @@ func New(ctx context.Context, opt *Options) (blob.Storage, error) {
 		Username:                            webdavUsername,
 		Password:                            webdavPassword,
 		TrustedServerCertificateFingerprint: hex.EncodeToString(fingerprintBytes[:]),
+		ListParallelism:                     opt.ListParallelism,
+		AtomicWrites:                        opt.AtomicWrites,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "error connecting to webdav storage")

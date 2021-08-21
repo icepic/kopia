@@ -11,6 +11,8 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/exp/mmap"
 
+	"github.com/kopia/kopia/internal/cache"
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/logging"
 )
@@ -79,7 +81,7 @@ func (c *diskCommittedContentIndexCache) hasIndexBlobID(ctx context.Context, ind
 	return false, errors.Wrapf(err, "error checking %v", indexBlobID)
 }
 
-func (c *diskCommittedContentIndexCache) addContentToCache(ctx context.Context, indexBlobID blob.ID, data []byte) error {
+func (c *diskCommittedContentIndexCache) addContentToCache(ctx context.Context, indexBlobID blob.ID, data gather.Bytes) error {
 	exists, err := c.hasIndexBlobID(ctx, indexBlobID)
 	if err != nil {
 		return err
@@ -89,7 +91,7 @@ func (c *diskCommittedContentIndexCache) addContentToCache(ctx context.Context, 
 		return nil
 	}
 
-	tmpFile, err := writeTempFileAtomic(c.dirname, data)
+	tmpFile, err := writeTempFileAtomic(c.dirname, data.ToByteSlice())
 	if err != nil {
 		return err
 	}
@@ -115,7 +117,7 @@ func writeTempFileAtomic(dirname string, data []byte) (string, error) {
 	tf, err := ioutil.TempFile(dirname, "tmp")
 	if err != nil {
 		if os.IsNotExist(err) {
-			os.MkdirAll(dirname, 0o700) //nolint:errcheck
+			os.MkdirAll(dirname, cache.DirMode) //nolint:errcheck
 			tf, err = ioutil.TempFile(dirname, "tmp")
 		}
 	}
@@ -136,6 +138,8 @@ func writeTempFileAtomic(dirname string, data []byte) (string, error) {
 }
 
 func (c *diskCommittedContentIndexCache) expireUnused(ctx context.Context, used []blob.ID) error {
+	c.log.Debugf("expireUnused (except %v)", used)
+
 	entries, err := ioutil.ReadDir(c.dirname)
 	if err != nil {
 		return errors.Wrap(err, "can't list cache")

@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/kopia/kopia/internal/gather"
 )
 
 // ErrSetTimeUnsupported is returned by implementations of Storage that don't support SetTime.
@@ -31,7 +34,7 @@ type Reader interface {
 	// If length>0, the the function retrieves a range of bytes [offset,offset+length)
 	// If length<0, the entire blob must be fetched.
 	// Returns ErrInvalidRange if the fetched blob length is invalid.
-	GetBlob(ctx context.Context, blobID ID, offset, length int64) ([]byte, error)
+	GetBlob(ctx context.Context, blobID ID, offset, length int64, output *gather.WriteBuffer) error
 
 	// GetMetadata returns Metadata about single blob.
 	GetMetadata(ctx context.Context, blobID ID) (Metadata, error)
@@ -74,6 +77,9 @@ type Storage interface {
 
 	// Close releases all resources associated with storage.
 	Close(ctx context.Context) error
+
+	// FlushCaches flushes any local caches associated with storage.
+	FlushCaches(ctx context.Context) error
 }
 
 // ID is a string that represents blob identifier.
@@ -152,35 +158,20 @@ func IterateAllPrefixesInParallel(ctx context.Context, parallelism int, st Stora
 // EnsureLengthExactly validates that length of the given slice is exactly the provided value.
 // and returns ErrInvalidRange if the length is of the slice if not.
 // As a special case length < 0 disables validation.
-func EnsureLengthExactly(b []byte, length int64) ([]byte, error) {
+func EnsureLengthExactly(gotLength int, length int64) error {
 	if length < 0 {
-		return b, nil
+		return nil
 	}
 
-	if len(b) != int(length) {
-		return nil, errors.Wrapf(ErrInvalidRange, "invalid length %v, expected %v", len(b), length)
+	if gotLength != int(length) {
+		return errors.Wrapf(ErrInvalidRange, "invalid length %v, expected %v", gotLength, length)
 	}
 
-	return b, nil
+	return nil
 }
 
-// EnsureLengthAndTruncate validates that length of the given slice is at least the provided value
-// and returns ErrInvalidRange if the length is of the slice if not.
-// As a special case length < 0 disables validation.
-func EnsureLengthAndTruncate(b []byte, length int64) ([]byte, error) {
-	if length < 0 {
-		return b, nil
-	}
-
-	if len(b) < int(length) {
-		return nil, errors.Wrapf(ErrInvalidRange, "invalid length %v, expected at least %v", len(b), length)
-	}
-
-	return b[0:length], nil
-}
-
-// IDsFroMetadata returns IDs for blobs in Metadata slice.
-func IDsFroMetadata(mds []Metadata) []ID {
+// IDsFromMetadata returns IDs for blobs in Metadata slice.
+func IDsFromMetadata(mds []Metadata) []ID {
 	ids := make([]ID, len(mds))
 
 	for i, md := range mds {
@@ -188,4 +179,64 @@ func IDsFroMetadata(mds []Metadata) []ID {
 	}
 
 	return ids
+}
+
+// TotalLength returns minimum timestamp for blobs in Metadata slice.
+func TotalLength(mds []Metadata) int64 {
+	var total int64
+
+	for _, md := range mds {
+		total += md.Length
+	}
+
+	return total
+}
+
+// MinTimestamp returns minimum timestamp for blobs in Metadata slice.
+func MinTimestamp(mds []Metadata) time.Time {
+	min := time.Time{}
+
+	for _, md := range mds {
+		if min.IsZero() || md.Timestamp.Before(min) {
+			min = md.Timestamp
+		}
+	}
+
+	return min
+}
+
+// MaxTimestamp returns maxinum timestamp for blobs in Metadata slice.
+func MaxTimestamp(mds []Metadata) time.Time {
+	max := time.Time{}
+
+	for _, md := range mds {
+		if md.Timestamp.After(max) {
+			max = md.Timestamp
+		}
+	}
+
+	return max
+}
+
+// DeleteMultiple deletes multiple blobs in parallel.
+func DeleteMultiple(ctx context.Context, st Storage, ids []ID, parallelism int) error {
+	eg, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, parallelism)
+
+	for _, id := range ids {
+		// acquire semaphore
+		sem <- struct{}{}
+
+		id := id
+
+		eg.Go(func() error {
+			defer func() {
+				<-sem // release semaphore
+			}()
+
+			return errors.Wrapf(st.DeleteBlob(ctx, id), "deleting %v", id)
+		})
+	}
+
+	return errors.Wrap(eg.Wait(), "error deleting blobs")
 }

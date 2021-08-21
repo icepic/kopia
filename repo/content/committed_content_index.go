@@ -6,11 +6,13 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/logging"
 )
@@ -25,22 +27,23 @@ type committedContentIndex struct {
 	rev   int64
 	cache committedContentIndexCache
 
-	mu     sync.Mutex
-	inUse  map[blob.ID]packIndex
-	merged mergedIndex
+	mu                sync.Mutex
+	deletionWatermark time.Time
+	inUse             map[blob.ID]packIndex
+	merged            mergedIndex
 
 	v1PerContentOverhead uint32
 	indexVersion         int
 
 	// fetchOne loads one index blob
-	fetchOne func(ctx context.Context, blobID blob.ID) ([]byte, error)
+	fetchOne func(ctx context.Context, blobID blob.ID, output *gather.WriteBuffer) error
 
 	log logging.Logger
 }
 
 type committedContentIndexCache interface {
 	hasIndexBlobID(ctx context.Context, indexBlob blob.ID) (bool, error)
-	addContentToCache(ctx context.Context, indexBlob blob.ID, data []byte) error
+	addContentToCache(ctx context.Context, indexBlob blob.ID, data gather.Bytes) error
 	openIndex(ctx context.Context, indexBlob blob.ID) (packIndex, error)
 	expireUnused(ctx context.Context, used []blob.ID) error
 }
@@ -55,6 +58,10 @@ func (c *committedContentIndex) getContent(contentID ID) (Info, error) {
 
 	info, err := c.merged.GetInfo(contentID)
 	if info != nil {
+		if c.shouldIgnore(info) {
+			return nil, ErrContentNotFound
+		}
+
 		return info, nil
 	}
 
@@ -65,8 +72,20 @@ func (c *committedContentIndex) getContent(contentID ID) (Info, error) {
 	return nil, err
 }
 
-func (c *committedContentIndex) addContent(ctx context.Context, indexBlobID blob.ID, data []byte, use bool) error {
-	atomic.AddInt64(&c.rev, 1)
+func (c *committedContentIndex) shouldIgnore(id Info) bool {
+	if !id.GetDeleted() {
+		return false
+	}
+
+	return !id.Timestamp().After(c.deletionWatermark)
+}
+
+func (c *committedContentIndex) addIndexBlob(ctx context.Context, indexBlobID blob.ID, data gather.Bytes, use bool) error {
+	// ensure we bump revision number AFTER this function
+	// doing it prematurely might confuse callers of revision() who may cache
+	// a set of old contents and associate it with new revision, before new contents
+	// are actually available.
+	defer atomic.AddInt64(&c.rev, 1)
 
 	if err := c.cache.addContentToCache(ctx, indexBlobID, data); err != nil {
 		return errors.Wrap(err, "error adding content to cache")
@@ -82,6 +101,8 @@ func (c *committedContentIndex) addContent(ctx context.Context, indexBlobID blob
 	if c.inUse[indexBlobID] != nil {
 		return nil
 	}
+
+	c.log.Debugf("use-new-committed-index %v", indexBlobID)
 
 	ndx, err := c.cache.openIndex(ctx, indexBlobID)
 	if err != nil {
@@ -99,16 +120,22 @@ func (c *committedContentIndex) listContents(r IDRange, cb func(i Info) error) e
 	m := append(mergedIndex(nil), c.merged...)
 	c.mu.Unlock()
 
-	return m.Iterate(r, cb)
+	return m.Iterate(r, func(i Info) error {
+		if c.shouldIgnore(i) {
+			return nil
+		}
+
+		return cb(i)
+	})
 }
 
-func (c *committedContentIndex) packFilesChanged(packFiles []blob.ID) bool {
-	if len(packFiles) != len(c.inUse) {
+func (c *committedContentIndex) indexFilesChanged(indexFiles []blob.ID) bool {
+	if len(indexFiles) != len(c.inUse) {
 		return true
 	}
 
-	for _, packFile := range packFiles {
-		if c.inUse[packFile] == nil {
+	for _, ndx := range indexFiles {
+		if c.inUse[ndx] == nil {
 			return true
 		}
 	}
@@ -116,7 +143,7 @@ func (c *committedContentIndex) packFilesChanged(packFiles []blob.ID) bool {
 	return false
 }
 
-func (c *committedContentIndex) merge(ctx context.Context, packFiles []blob.ID) (merged mergedIndex, used map[blob.ID]packIndex, finalErr error) {
+func (c *committedContentIndex) merge(ctx context.Context, indexFiles []blob.ID) (merged mergedIndex, used map[blob.ID]packIndex, finalErr error) {
 	used = map[blob.ID]packIndex{}
 
 	defer func() {
@@ -126,7 +153,7 @@ func (c *committedContentIndex) merge(ctx context.Context, packFiles []blob.ID) 
 		}
 	}()
 
-	for _, e := range packFiles {
+	for _, e := range indexFiles {
 		ndx, err := c.cache.openIndex(ctx, e)
 		if err != nil {
 			return nil, nil, errors.Wrapf(err, "unable to open pack index %q", e)
@@ -148,17 +175,21 @@ func (c *committedContentIndex) merge(ctx context.Context, packFiles []blob.ID) 
 	return
 }
 
-// Uses packFiles for indexing. An error is returned if the
+// Uses indexFiles for indexing. An error is returned if the
 // indices cannot be read for any reason.
-func (c *committedContentIndex) use(ctx context.Context, packFiles []blob.ID) error {
+func (c *committedContentIndex) use(ctx context.Context, indexFiles []blob.ID, ignoreDeletedBefore time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.packFilesChanged(packFiles) {
+	c.deletionWatermark = ignoreDeletedBefore
+
+	if !c.indexFilesChanged(indexFiles) {
 		return nil
 	}
 
-	mergedAndCombined, newInUse, err := c.merge(ctx, packFiles)
+	c.log.Debugf("use-indexes %v", indexFiles)
+
+	mergedAndCombined, newInUse, err := c.merge(ctx, indexFiles)
 	if err != nil {
 		return err
 	}
@@ -168,8 +199,8 @@ func (c *committedContentIndex) use(ctx context.Context, packFiles []blob.ID) er
 	c.merged = mergedAndCombined
 	c.inUse = newInUse
 
-	if err := c.cache.expireUnused(ctx, packFiles); err != nil {
-		c.log.Errorf("unable to expire unused content index files: %v", err)
+	if err := c.cache.expireUnused(ctx, indexFiles); err != nil {
+		c.log.Errorf("unable to expire unused index files: %v", err)
 	}
 
 	return nil
@@ -243,13 +274,17 @@ func (c *committedContentIndex) fetchIndexBlobs(ctx context.Context, indexBlobs 
 	eg, ctx := errgroup.WithContext(ctx)
 	for i := 0; i < parallelFetches; i++ {
 		eg.Go(func() error {
+			var data gather.WriteBuffer
+			defer data.Close()
+
 			for indexBlobID := range ch {
-				data, err := c.fetchOne(ctx, indexBlobID)
-				if err != nil {
+				data.Reset()
+
+				if err := c.fetchOne(ctx, indexBlobID, &data); err != nil {
 					return errors.Wrapf(err, "error loading index blob %v", indexBlobID)
 				}
 
-				if err := c.addContent(ctx, indexBlobID, data, false); err != nil {
+				if err := c.addIndexBlob(ctx, indexBlobID, data.Bytes(), false); err != nil {
 					return errors.Wrap(err, "unable to add to committed content cache")
 				}
 			}
@@ -288,7 +323,7 @@ func (c *committedContentIndex) missingIndexBlobs(ctx context.Context, blobs []b
 func newCommittedContentIndex(caching *CachingOptions,
 	v1PerContentOverhead uint32,
 	indexVersion int,
-	fetchOne func(ctx context.Context, blobID blob.ID) ([]byte, error),
+	fetchOne func(ctx context.Context, blobID blob.ID, output *gather.WriteBuffer) error,
 	baseLog logging.Logger,
 ) *committedContentIndex {
 	log := logging.WithPrefix("[committed-content-index] ", baseLog)

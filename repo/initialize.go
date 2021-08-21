@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/encryption"
@@ -47,7 +48,10 @@ func Initialize(ctx context.Context, st blob.Storage, opt *NewRepositoryOptions,
 	}
 
 	// get the blob - expect ErrNotFound
-	_, err := st.GetBlob(ctx, FormatBlobID, 0, -1)
+	var tmp gather.WriteBuffer
+	defer tmp.Close()
+
+	err := st.GetBlob(ctx, FormatBlobID, 0, -1, &tmp)
 	if err == nil {
 		return ErrAlreadyInitialized
 	}
@@ -58,12 +62,17 @@ func Initialize(ctx context.Context, st blob.Storage, opt *NewRepositoryOptions,
 
 	format := formatBlobFromOptions(opt)
 
-	masterKey, err := format.deriveMasterKeyFromPassword(password)
+	formatEncryptionKey, err := format.deriveFormatEncryptionKeyFromPassword(password)
 	if err != nil {
-		return errors.Wrap(err, "unable to derive master key")
+		return errors.Wrap(err, "unable to derive format encryption key")
 	}
 
-	if err := encryptFormatBytes(format, repositoryObjectFormatFromOptions(opt), masterKey, format.UniqueID); err != nil {
+	f := repositoryObjectFormatFromOptions(opt)
+	if err := f.MutableParameters.Validate(); err != nil {
+		return errors.Wrap(err, "invalid parameters")
+	}
+
+	if err := encryptFormatBytes(format, f, formatEncryptionKey, format.UniqueID); err != nil {
 		return errors.Wrap(err, "unable to encrypt format bytes")
 	}
 
@@ -89,13 +98,17 @@ func formatBlobFromOptions(opt *NewRepositoryOptions) *formatBlob {
 func repositoryObjectFormatFromOptions(opt *NewRepositoryOptions) *repositoryObjectFormat {
 	f := &repositoryObjectFormat{
 		FormattingOptions: content.FormattingOptions{
-			Version:      1,
-			Hash:         applyDefaultString(opt.BlockFormat.Hash, hashing.DefaultAlgorithm),
-			Encryption:   applyDefaultString(opt.BlockFormat.Encryption, encryption.DefaultAlgorithm),
-			HMACSecret:   applyDefaultRandomBytes(opt.BlockFormat.HMACSecret, hmacSecretLength),
-			MasterKey:    applyDefaultRandomBytes(opt.BlockFormat.MasterKey, masterKeyLength),
-			MaxPackSize:  applyDefaultInt(opt.BlockFormat.MaxPackSize, 20<<20), //nolint:gomnd
-			IndexVersion: applyDefaultInt(opt.BlockFormat.IndexVersion, content.DefaultIndexVersion),
+			Version:    1,
+			Hash:       applyDefaultString(opt.BlockFormat.Hash, hashing.DefaultAlgorithm),
+			Encryption: applyDefaultString(opt.BlockFormat.Encryption, encryption.DefaultAlgorithm),
+			HMACSecret: applyDefaultRandomBytes(opt.BlockFormat.HMACSecret, hmacSecretLength),
+			MasterKey:  applyDefaultRandomBytes(opt.BlockFormat.MasterKey, masterKeyLength),
+			MutableParameters: content.MutableParameters{
+				MaxPackSize:     applyDefaultInt(opt.BlockFormat.MaxPackSize, 20<<20), //nolint:gomnd
+				IndexVersion:    applyDefaultInt(opt.BlockFormat.IndexVersion, content.DefaultIndexVersion),
+				EpochParameters: opt.BlockFormat.EpochParameters,
+			},
+			EnablePasswordChange: opt.BlockFormat.EnablePasswordChange,
 		},
 		Format: object.Format{
 			Splitter: applyDefaultString(opt.ObjectFormat.Splitter, splitter.DefaultAlgorithm),

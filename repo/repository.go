@@ -53,7 +53,7 @@ type DirectRepository interface {
 	ObjectFormat() object.Format
 	BlobReader() blob.Reader
 	ContentReader() content.Reader
-	IndexBlobReader() content.IndexBlobReader
+	IndexBlobs(ctx context.Context, includeInactive bool) ([]content.IndexBlobInfo, error)
 	Crypter() *content.Crypter
 
 	NewDirectWriter(ctx context.Context, opt WriteSessionOptions) (context.Context, DirectRepositoryWriter, error)
@@ -73,18 +73,19 @@ type DirectRepositoryWriter interface {
 
 	BlobStorage() blob.Storage
 	ContentManager() *content.WriteManager
-	Upgrade(ctx context.Context) error
+	SetParameters(ctx context.Context, m content.MutableParameters) error
+	ChangePassword(ctx context.Context, newPassword string) error
 }
 
 type directRepositoryParameters struct {
-	uniqueID       []byte
-	configFile     string
-	cachingOptions content.CachingOptions
-	cliOpts        ClientOptions
-	timeNow        func() time.Time
-	formatBlob     *formatBlob
-	masterKey      []byte
-	nextWriterID   *int32
+	uniqueID            []byte
+	configFile          string
+	cachingOptions      content.CachingOptions
+	cliOpts             ClientOptions
+	timeNow             func() time.Time
+	formatBlob          *formatBlob
+	formatEncryptionKey []byte
+	nextWriterID        *int32
 }
 
 // directRepository is an implementation of repository that directly manipulates underlying storage.
@@ -102,7 +103,14 @@ type directRepository struct {
 
 // DeriveKey derives encryption key of the provided length from the master key.
 func (r *directRepository) DeriveKey(purpose []byte, keyLength int) []byte {
-	return deriveKeyFromMasterKey(r.masterKey, r.uniqueID, purpose, keyLength)
+	if r.cmgr.ContentFormat().EnablePasswordChange {
+		return deriveKeyFromMasterKey(r.cmgr.ContentFormat().MasterKey, r.uniqueID, purpose, keyLength)
+	}
+
+	// version of kopia <v0.9 had a bug where certain keys were derived directly from
+	// the password and not from the random master key. This made it impossible to change
+	// password.
+	return deriveKeyFromMasterKey(r.formatEncryptionKey, r.uniqueID, purpose, keyLength)
 }
 
 // ClientOptions returns client options.
@@ -237,10 +245,6 @@ func (r *directRepository) Close(ctx context.Context) error {
 	default:
 	}
 
-	if err := r.omgr.Close(); err != nil {
-		return errors.Wrap(err, "error closing object manager")
-	}
-
 	// this will release shared manager and MAY release blob.Store (on last outstanding reference).
 	if err := r.cmgr.Close(ctx); err != nil {
 		return errors.Wrap(err, "error closing content-addressable storage manager")
@@ -280,33 +284,15 @@ func (r *directRepository) ContentReader() content.Reader {
 	return r.cmgr
 }
 
-// IndexBlobReader returns the index blob reader.
-func (r *directRepository) IndexBlobReader() content.IndexBlobReader {
-	return r.cmgr
+// IndexBlobs returns the index blobs in use.
+func (r *directRepository) IndexBlobs(ctx context.Context, includeInactive bool) ([]content.IndexBlobInfo, error) {
+	// nolint:wrapcheck
+	return r.cmgr.IndexBlobs(ctx, includeInactive)
 }
 
 // Refresh makes external changes visible to repository.
 func (r *directRepository) Refresh(ctx context.Context) error {
 	return errors.Wrap(r.cmgr.Refresh(ctx), "error refreshing content index")
-}
-
-// RefreshPeriodically periodically refreshes the repository to reflect the changes made by other hosts.
-func (r *directRepository) RefreshPeriodically(ctx context.Context, interval time.Duration) {
-	for {
-		select {
-		case <-r.closed:
-			// stop background refresh when repository is closed
-			return
-
-		case <-ctx.Done():
-			return
-
-		case <-time.After(interval):
-			if err := r.Refresh(ctx); err != nil {
-				log(ctx).Errorf("error refreshing repository: %v", err)
-			}
-		}
-	}
 }
 
 // Time returns the current local time for the repo.

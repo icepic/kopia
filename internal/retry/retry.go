@@ -14,9 +14,11 @@ var log = logging.GetContextLoggerFunc("retry")
 
 var (
 	maxAttempts             = 10
-	retryInitialSleepAmount = 1 * time.Second
+	retryInitialSleepAmount = 100 * time.Millisecond
 	retryMaxSleepAmount     = 32 * time.Second
 )
+
+const retryExponent = 1.5
 
 // AttemptFunc performs an attempt and returns a value (optional, may be nil) and an error.
 type AttemptFunc func() (interface{}, error)
@@ -28,7 +30,7 @@ type IsRetriableFunc func(err error) bool
 // deemed retriable by the provided function. The delay between retries grows exponentially up to
 // a certain limit.
 func WithExponentialBackoff(ctx context.Context, desc string, attempt AttemptFunc, isRetriableError IsRetriableFunc) (interface{}, error) {
-	return internalRetry(ctx, desc, attempt, isRetriableError, retryInitialSleepAmount, retryMaxSleepAmount, maxAttempts, 1.5)
+	return internalRetry(ctx, desc, attempt, isRetriableError, retryInitialSleepAmount, retryMaxSleepAmount, maxAttempts, retryExponent)
 }
 
 // Periodically runs the provided attempt until it succeeds, waiting given fixed amount between attempts.
@@ -51,11 +53,15 @@ func PeriodicallyNoValue(ctx context.Context, interval time.Duration, count int,
 func internalRetry(ctx context.Context, desc string, attempt AttemptFunc, isRetriableError IsRetriableFunc, initial, max time.Duration, count int, factor float64) (interface{}, error) {
 	sleepAmount := initial
 
+	var lastError error
+
 	for i := 0; i < count; i++ {
 		v, err := attempt()
 		if err == nil {
 			return v, nil
 		}
+
+		lastError = err
 
 		if !isRetriableError(err) {
 			return v, err
@@ -70,7 +76,7 @@ func internalRetry(ctx context.Context, desc string, attempt AttemptFunc, isRetr
 		}
 	}
 
-	return nil, errors.Errorf("unable to complete %v despite %v retries", desc, count)
+	return nil, errors.Errorf("unable to complete %v despite %v retries, last error: %v", desc, count, lastError)
 }
 
 // WithExponentialBackoffNoValue is a shorthand for WithExponentialBackoff except the

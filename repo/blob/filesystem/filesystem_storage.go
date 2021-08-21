@@ -15,6 +15,8 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/gather"
+	"github.com/kopia/kopia/internal/iocopy"
 	"github.com/kopia/kopia/internal/retry"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/blob/sharded"
@@ -24,8 +26,9 @@ import (
 var log = logging.GetContextLoggerFunc("repo/filesystem")
 
 const (
-	fsStorageType        = "filesystem"
-	fsStorageChunkSuffix = ".f"
+	fsStorageType           = "filesystem"
+	fsStorageChunkSuffix    = ".f"
+	tempFileRandomSuffixLen = 8
 
 	fsDefaultFileMode os.FileMode = 0o600
 	fsDefaultDirMode  os.FileMode = 0o700
@@ -73,58 +76,59 @@ func isRetriable(err error) bool {
 	return errors.Is(err, errRetriableInvalidLength)
 }
 
-func (fs *fsImpl) GetBlobFromPath(ctx context.Context, dirPath, path string, offset, length int64) ([]byte, error) {
-	val, err := retry.WithExponentialBackoff(ctx, "GetBlobFromPath:"+path, func() (interface{}, error) {
+func (fs *fsImpl) GetBlobFromPath(ctx context.Context, dirPath, path string, offset, length int64, output *gather.WriteBuffer) error {
+	err := retry.WithExponentialBackoffNoValue(ctx, "GetBlobFromPath:"+path, func() error {
+		output.Reset()
+
 		f, err := os.Open(path) //nolint:gosec
 		if err != nil {
 			//nolint:wrapcheck
-			return nil, err
+			return err
 		}
 
 		defer f.Close() //nolint:errcheck,gosec
 
 		if length < 0 {
 			// nolint:wrapcheck
-			return ioutil.ReadAll(f)
+			return iocopy.JustCopy(output, f)
 		}
 
 		if _, err = f.Seek(offset, io.SeekStart); err != nil {
 			// do not wrap seek error, we don't want to retry on it.
-			return nil, errors.Errorf("seek error: %v", err)
+			return errors.Errorf("seek error: %v", err)
 		}
 
-		b, err := ioutil.ReadAll(io.LimitReader(f, length))
-		if err != nil {
+		if err := iocopy.JustCopy(output, io.LimitReader(f, length)); err != nil {
 			//nolint:wrapcheck
-			return nil, err
+			return err
 		}
 
-		if int64(len(b)) != length && length > 0 {
+		if int64(output.Length()) != length && length > 0 {
 			if runtime.GOOS == "darwin" {
 				if st, err := f.Stat(); err == nil && st.Size() == 0 {
 					// this sometimes fails on macOS for unknown reasons, likely a bug in the filesystem
 					// retry deals with this transient state.
 					// see see https://github.com/kopia/kopia/issues/299
-					return nil, errRetriableInvalidLength
+					return errRetriableInvalidLength
 				}
 			}
 
-			return nil, errors.Errorf("invalid length")
+			return errors.Errorf("invalid length")
 		}
 
-		return b, nil
+		return nil
 	}, isRetriable)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, blob.ErrBlobNotFound
+			return blob.ErrBlobNotFound
 		}
 
 		// nolint:wrapcheck
-		return nil, err
+		return err
 	}
 
 	// nolint:wrapcheck
-	return blob.EnsureLengthExactly(val.([]byte), length)
+	return blob.EnsureLengthExactly(output.Length(), length)
 }
 
 func (fs *fsImpl) GetMetadataFromPath(ctx context.Context, dirPath, path string) (blob.Metadata, error) {
@@ -147,7 +151,7 @@ func (fs *fsImpl) GetMetadataFromPath(ctx context.Context, dirPath, path string)
 func (fs *fsImpl) PutBlobInPath(ctx context.Context, dirPath, path string, data blob.Bytes) error {
 	// nolint:wrapcheck
 	return retry.WithExponentialBackoffNoValue(ctx, "PutBlobInPath:"+path, func() error {
-		randSuffix := make([]byte, 8)
+		randSuffix := make([]byte, tempFileRandomSuffixLen)
 		if _, err := rand.Read(randSuffix); err != nil {
 			return errors.Wrap(err, "can't get random bytes")
 		}
@@ -277,6 +281,10 @@ func (fs *fsStorage) Close(ctx context.Context) error {
 	return nil
 }
 
+func (fs *fsStorage) FlushCaches(ctx context.Context) error {
+	return nil
+}
+
 // New creates new filesystem-backed storage in a specified directory.
 func New(ctx context.Context, opts *Options) (blob.Storage, error) {
 	var err error
@@ -287,10 +295,11 @@ func New(ctx context.Context, opts *Options) (blob.Storage, error) {
 
 	return &fsStorage{
 		sharded.Storage{
-			Impl:     &fsImpl{Options: *opts},
-			RootPath: opts.Path,
-			Suffix:   fsStorageChunkSuffix,
-			Shards:   opts.shards(),
+			Impl:            &fsImpl{Options: *opts},
+			RootPath:        opts.Path,
+			Suffix:          fsStorageChunkSuffix,
+			Shards:          opts.shards(),
+			ListParallelism: opts.ListParallelism,
 		},
 	}, nil
 }

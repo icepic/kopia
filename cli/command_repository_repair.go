@@ -15,7 +15,7 @@ import (
 type commandRepositoryRepair struct {
 	repairCommandRecoverFormatBlob         string
 	repairCommandRecoverFormatBlobPrefixes []string
-	repairDryDrun                          bool
+	repairDryRun                           bool
 }
 
 func (c *commandRepositoryRepair) setup(svc advancedAppServices, parent commandParent) {
@@ -23,7 +23,7 @@ func (c *commandRepositoryRepair) setup(svc advancedAppServices, parent commandP
 
 	cmd.Flag("recover-format", "Recover format blob from a copy").Default("auto").EnumVar(&c.repairCommandRecoverFormatBlob, "auto", "yes", "no")
 	cmd.Flag("recover-format-block-prefixes", "Prefixes of file names").StringsVar(&c.repairCommandRecoverFormatBlobPrefixes)
-	cmd.Flag("dry-run", "Do not modify repository").Short('n').BoolVar(&c.repairDryDrun)
+	cmd.Flag("dry-run", "Do not modify repository").Short('n').BoolVar(&c.repairDryRun)
 
 	for _, prov := range storageProviders {
 		f := prov.newFlags()
@@ -56,7 +56,10 @@ func (c *commandRepositoryRepair) runRepairCommandWithStorage(ctx context.Contex
 	case "auto":
 		log(ctx).Infof("looking for format blob...")
 
-		if _, err := st.GetBlob(ctx, repo.FormatBlobID, 0, -1); err == nil {
+		var tmp gather.WriteBuffer
+		defer tmp.Close()
+
+		if err := st.GetBlob(ctx, repo.FormatBlobID, 0, -1, &tmp); err == nil {
 			log(ctx).Infof("format blob already exists, not recovering, pass --recover-format=yes")
 			return nil
 		}
@@ -80,7 +83,7 @@ func (c *commandRepositoryRepair) recoverFormatBlob(ctx context.Context, st blob
 		err := st.ListBlobs(ctx, blob.ID(prefix), func(bi blob.Metadata) error {
 			log(ctx).Infof("looking for replica of format blob in %v...", bi.BlobID)
 			if b, err := repo.RecoverFormatBlob(ctx, st, bi.BlobID, bi.Length); err == nil {
-				if !c.repairDryDrun {
+				if !c.repairDryRun {
 					if puterr := st.PutBlob(ctx, repo.FormatBlobID, gather.FromSlice(b)); puterr != nil {
 						return errors.Wrap(puterr, "error writing format blob")
 					}

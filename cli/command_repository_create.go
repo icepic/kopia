@@ -6,6 +6,7 @@ import (
 	"github.com/alecthomas/kingpin"
 	"github.com/pkg/errors"
 
+	"github.com/kopia/kopia/internal/epoch"
 	"github.com/kopia/kopia/repo"
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/content"
@@ -16,12 +17,20 @@ import (
 	"github.com/kopia/kopia/snapshot/policy"
 )
 
+const runValidationNote = `NOTE: To validate that your provider is compatible with Kopia, please run:
+
+$ kopia repository validate-provider
+
+`
+
 type commandRepositoryCreate struct {
 	createBlockHashFormat       string
 	createBlockEncryptionFormat string
 	createSplitter              string
 	createOnly                  bool
 	createIndexVersion          int
+	createIndexEpochs           bool
+	enablePasswordChange        bool
 
 	co  connectOptions
 	svc advancedAppServices
@@ -35,7 +44,9 @@ func (c *commandRepositoryCreate) setup(svc advancedAppServices, parent commandP
 	cmd.Flag("encryption", "Content encryption algorithm.").PlaceHolder("ALGO").Default(encryption.DefaultAlgorithm).EnumVar(&c.createBlockEncryptionFormat, encryption.SupportedAlgorithms(false)...)
 	cmd.Flag("object-splitter", "The splitter to use for new objects in the repository").Default(splitter.DefaultAlgorithm).EnumVar(&c.createSplitter, splitter.SupportedAlgorithms()...)
 	cmd.Flag("create-only", "Create repository, but don't connect to it.").Short('c').BoolVar(&c.createOnly)
+	cmd.Flag("enable-password-change", "Enable password change").Hidden().Default("true").BoolVar(&c.enablePasswordChange)
 	cmd.Flag("index-version", "Force particular index version").Hidden().Envar("KOPIA_CREATE_INDEX_VERSION").IntVar(&c.createIndexVersion)
+	cmd.Flag("enable-index-epochs", "Enable index epochs").Hidden().Envar("KOPIA_ENABLE_INDEX_EPOCHS").BoolVar(&c.createIndexEpochs)
 
 	c.co.setup(cmd)
 	c.svc = svc
@@ -62,12 +73,24 @@ func (c *commandRepositoryCreate) setup(svc advancedAppServices, parent commandP
 	}
 }
 
+func (c *commandRepositoryCreate) epochParametersFromFlags() epoch.Parameters {
+	if !c.createIndexEpochs {
+		return epoch.Parameters{}
+	}
+
+	return epoch.DefaultParameters
+}
+
 func (c *commandRepositoryCreate) newRepositoryOptionsFromFlags() *repo.NewRepositoryOptions {
 	return &repo.NewRepositoryOptions{
 		BlockFormat: content.FormattingOptions{
-			Hash:         c.createBlockHashFormat,
-			Encryption:   c.createBlockEncryptionFormat,
-			IndexVersion: c.createIndexVersion,
+			Hash:       c.createBlockHashFormat,
+			Encryption: c.createBlockEncryptionFormat,
+			MutableParameters: content.MutableParameters{
+				IndexVersion:    c.createIndexVersion,
+				EpochParameters: c.epochParametersFromFlags(),
+			},
+			EnablePasswordChange: c.enablePasswordChange,
 		},
 
 		ObjectFormat: object.Format{
@@ -120,7 +143,13 @@ func (c *commandRepositoryCreate) runCreateCommandWithStorage(ctx context.Contex
 		return errors.Wrap(err, "unable to connect to repository")
 	}
 
-	return c.populateRepository(ctx, pass)
+	if err := c.populateRepository(ctx, pass); err != nil {
+		return errors.Wrap(err, "error populating repository")
+	}
+
+	noteColor.Fprintf(c.out.stdout(), runValidationNote) // nolint:errcheck
+
+	return nil
 }
 
 func (c *commandRepositoryCreate) populateRepository(ctx context.Context, password string) error {

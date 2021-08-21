@@ -34,7 +34,7 @@ func (c *commandIndexList) run(ctx context.Context, rep repo.DirectRepository) e
 	jl.begin(&c.jo)
 	defer jl.end()
 
-	blks, err := rep.IndexBlobReader().IndexBlobs(ctx, c.blockIndexListIncludeSuperseded)
+	blks, err := rep.IndexBlobs(ctx, c.blockIndexListIncludeSuperseded)
 	if err != nil {
 		return errors.Wrap(err, "error listing index blobs")
 	}
@@ -58,7 +58,7 @@ func (c *commandIndexList) run(ctx context.Context, rep repo.DirectRepository) e
 		if c.jo.jsonOutput {
 			jl.emit(b)
 		} else {
-			c.out.printStdout("%-40v %10v %v %v\n", b.BlobID, b.Length, formatTimestampPrecise(b.Timestamp), b.Superseded)
+			c.out.printStdout("%-60v %10v %v %v\n", b.BlobID, b.Length, formatTimestampPrecise(b.Timestamp), b.Superseded)
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -14,6 +15,8 @@ import (
 	"github.com/kopia/kopia/repo/content"
 	"github.com/kopia/kopia/repo/object"
 )
+
+const configDirMode = 0o700
 
 // ClientOptions contains client-specific options that are persisted in local configuration file.
 type ClientOptions struct {
@@ -26,6 +29,8 @@ type ClientOptions struct {
 	Description string `json:"description,omitempty"`
 
 	EnableActions bool `json:"enableActions"`
+
+	FormatBlobCacheDuration time.Duration `json:"formatBlobCacheDuration,omitempty"`
 }
 
 // ApplyDefaults returns a copy of ClientOptions with defaults filled out.
@@ -40,6 +45,10 @@ func (o ClientOptions) ApplyDefaults(ctx context.Context, defaultDesc string) Cl
 
 	if o.Description == "" {
 		o.Description = defaultDesc
+	}
+
+	if o.FormatBlobCacheDuration == 0 {
+		o.FormatBlobCacheDuration = defaultFormatBlobCacheDuration
 	}
 
 	return o
@@ -109,7 +118,7 @@ func (lc *LocalConfig) writeToFile(filename string) error {
 		return errors.Wrap(err, "error creating config file contents")
 	}
 
-	if err = os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(filename), configDirMode); err != nil {
 		return errors.Wrap(err, "unable to create config directory")
 	}
 

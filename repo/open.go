@@ -1,7 +1,6 @@
 package repo
 
 import (
-	"bytes"
 	"context"
 	"io/ioutil"
 	"os"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/kopia/kopia/internal/atomicfile"
 	"github.com/kopia/kopia/internal/cache"
+	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
 	loggingwrapper "github.com/kopia/kopia/repo/blob/logging"
 	"github.com/kopia/kopia/repo/blob/readonly"
@@ -29,8 +30,14 @@ const CacheDirMarkerFile = "CACHEDIR.TAG"
 // CacheDirMarkerHeader is the header signature for cache dir marker files.
 const CacheDirMarkerHeader = "Signature: 8a477f597d28d172789f06886806bc55"
 
-// refresh indexes every 15 minutes while the repository remains open.
-const backgroundRefreshInterval = 15 * time.Minute
+// defaultFormatBlobCacheDuration is the duration for which we treat cached kopia.repository
+// as valid.
+const defaultFormatBlobCacheDuration = 15 * time.Minute
+
+// localCacheIntegrityHMACSecretLength length of HMAC secret protecting local cache items.
+const localCacheIntegrityHMACSecretLength = 16
+
+var localCacheIntegrityPurpose = []byte("local-cache-integrity")
 
 const cacheDirMarkerContents = CacheDirMarkerHeader + `
 #
@@ -96,6 +103,7 @@ func getContentCacheOrNil(ctx context.Context, opt *content.CachingOptions, pass
 	// derive content cache key from the password & HMAC secret using scrypt.
 	salt := append([]byte("content-cache-protection"), opt.HMACSecret...)
 
+	// nolint:gomnd
 	cacheEncryptionKey, err := scrypt.Key([]byte(password), salt, 65536, 8, 1, 32)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to derive cache encryption key from password")
@@ -161,7 +169,7 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 	caching = caching.CloneOrDefault()
 
 	// Read format blob, potentially from cache.
-	fb, err := readAndCacheFormatBlobBytes(ctx, st, caching.CacheDirectory)
+	fb, err := readAndCacheFormatBlobBytes(ctx, st, caching.CacheDirectory, lc.FormatBlobCacheDuration)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to read format blob")
 	}
@@ -180,17 +188,22 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 		return nil, errors.Errorf("unable to add checksum")
 	}
 
-	masterKey, err := f.deriveMasterKeyFromPassword(password)
+	formatEncryptionKey, err := f.deriveFormatEncryptionKeyFromPassword(password)
 	if err != nil {
 		return nil, err
 	}
 
-	repoConfig, err := f.decryptFormatBytes(masterKey)
+	repoConfig, err := f.decryptFormatBytes(formatEncryptionKey)
 	if err != nil {
 		return nil, ErrInvalidPassword
 	}
 
-	caching.HMACSecret = deriveKeyFromMasterKey(masterKey, f.UniqueID, []byte("local-cache-integrity"), 16)
+	if repoConfig.FormattingOptions.EnablePasswordChange {
+		caching.HMACSecret = deriveKeyFromMasterKey(repoConfig.HMACSecret, f.UniqueID, localCacheIntegrityPurpose, localCacheIntegrityHMACSecretLength)
+	} else {
+		// deriving from formatEncryptionKey was actually a bug, that only matters will change when we change the password
+		caching.HMACSecret = deriveKeyFromMasterKey(formatEncryptionKey, f.UniqueID, localCacheIntegrityPurpose, localCacheIntegrityHMACSecretLength)
+	}
 
 	fo := &repoConfig.FormattingOptions
 
@@ -203,6 +216,11 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 		RepositoryFormatBytes: fb,
 		TimeNow:               defaultTime(options.TimeNowFunc),
 		DisableInternalLog:    options.DisableInternalLog,
+	}
+
+	// do not embed repository format info in pack blobs when password change is enabled.
+	if fo.EnablePasswordChange {
+		cmOpts.RepositoryFormatBytes = nil
 	}
 
 	scm, err := content.NewSharedManager(ctx, st, fo, caching, cmOpts)
@@ -232,19 +250,17 @@ func openWithConfig(ctx context.Context, st blob.Storage, lc *LocalConfig, passw
 		mmgr:  manifests,
 		sm:    scm,
 		directRepositoryParameters: directRepositoryParameters{
-			uniqueID:       f.UniqueID,
-			cachingOptions: *caching,
-			formatBlob:     f,
-			masterKey:      masterKey,
-			timeNow:        cmOpts.TimeNow,
-			cliOpts:        lc.ClientOptions.ApplyDefaults(ctx, "Repository in "+st.DisplayName()),
-			configFile:     configFile,
-			nextWriterID:   new(int32),
+			uniqueID:            f.UniqueID,
+			cachingOptions:      *caching,
+			formatBlob:          f,
+			formatEncryptionKey: formatEncryptionKey,
+			timeNow:             cmOpts.TimeNow,
+			cliOpts:             lc.ClientOptions.ApplyDefaults(ctx, "Repository in "+st.DisplayName()),
+			configFile:          configFile,
+			nextWriterID:        new(int32),
 		},
 		closed: make(chan struct{}),
 	}
-
-	go dr.RefreshPeriodically(ctx, backgroundRefreshInterval)
 
 	return dr, nil
 }
@@ -278,31 +294,71 @@ func writeCacheMarker(cacheDir string) error {
 	return errors.Wrap(f.Close(), "error closing cache marker file")
 }
 
-func readAndCacheFormatBlobBytes(ctx context.Context, st blob.Storage, cacheDirectory string) ([]byte, error) {
-	cachedFile := filepath.Join(cacheDirectory, "kopia.repository")
+func formatBytesCachingEnabled(cacheDirectory string, validDuration time.Duration) bool {
+	if cacheDirectory == "" {
+		return false
+	}
 
-	if cacheDirectory != "" {
-		if err := os.MkdirAll(cacheDirectory, 0o700); err != nil && !os.IsExist(err) {
-			log(ctx).Errorf("unable to create cache directory: %v", err)
+	return validDuration > 0
+}
+
+func readFormatBlobBytesFromCache(ctx context.Context, cachedFile string, validDuration time.Duration) ([]byte, error) {
+	cst, err := os.Stat(cachedFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "unable to open cache file")
+	}
+
+	if clock.Since(cst.ModTime()) > validDuration {
+		// got cached file, but it's too old, remove it
+		if err := os.Remove(cachedFile); err != nil {
+			log(ctx).Debugf("unable to remove cache file: %v", err)
 		}
 
-		b, err := ioutil.ReadFile(cachedFile) //nolint:gosec
-		if err == nil {
-			// read from cache.
-			return b, nil
+		return nil, errors.Errorf("cached file too old")
+	}
+
+	return ioutil.ReadFile(cachedFile) //nolint:gosec,wrapcheck
+}
+
+func readAndCacheFormatBlobBytes(ctx context.Context, st blob.Storage, cacheDirectory string, validDuration time.Duration) ([]byte, error) {
+	cachedFile := filepath.Join(cacheDirectory, "kopia.repository")
+
+	if validDuration == 0 {
+		validDuration = defaultFormatBlobCacheDuration
+	}
+
+	if cacheDirectory != "" {
+		if err := os.MkdirAll(cacheDirectory, cache.DirMode); err != nil && !os.IsExist(err) {
+			log(ctx).Errorf("unable to create cache directory: %v", err)
 		}
 	}
 
-	b, err := st.GetBlob(ctx, FormatBlobID, 0, -1)
-	if err != nil {
+	cacheEnabled := formatBytesCachingEnabled(cacheDirectory, validDuration)
+	if cacheEnabled {
+		b, err := readFormatBlobBytesFromCache(ctx, cachedFile, validDuration)
+		if err == nil {
+			log(ctx).Debugf("kopia.repository retrieved from cache")
+
+			return b, nil
+		}
+
+		log(ctx).Debugf("kopia.repository could not be fetched from cache: %v", err)
+	} else {
+		log(ctx).Debugf("kopia.repository cache not enabled")
+	}
+
+	var b gather.WriteBuffer
+	defer b.Close()
+
+	if err := st.GetBlob(ctx, FormatBlobID, 0, -1, &b); err != nil {
 		return nil, errors.Wrap(err, "error getting format blob")
 	}
 
-	if cacheDirectory != "" {
-		if err := atomicfile.Write(cachedFile, bytes.NewReader(b)); err != nil {
+	if cacheEnabled {
+		if err := atomicfile.Write(cachedFile, b.Bytes().Reader()); err != nil {
 			log(ctx).Errorf("warning: unable to write cache: %v", err)
 		}
 	}
 
-	return b, nil
+	return b.ToByteSlice(), nil
 }

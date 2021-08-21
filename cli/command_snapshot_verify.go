@@ -27,7 +27,7 @@ type commandSnapshotVerify struct {
 	verifyCommandAllSources     bool
 	verifyCommandSources        []string
 	verifyCommandParallel       int
-	verifyCommandFilesPercent   int
+	verifyCommandFilesPercent   float64
 }
 
 func (c *commandSnapshotVerify) setup(svc appServices, parent commandParent) {
@@ -38,7 +38,7 @@ func (c *commandSnapshotVerify) setup(svc appServices, parent commandParent) {
 	cmd.Flag("all-sources", "Verify all snapshots (DEPRECATED)").Hidden().BoolVar(&c.verifyCommandAllSources)
 	cmd.Flag("sources", "Verify the provided sources").StringsVar(&c.verifyCommandSources)
 	cmd.Flag("parallel", "Parallelization").Default("16").IntVar(&c.verifyCommandParallel)
-	cmd.Flag("verify-files-percent", "Randomly verify a percentage of files").Default("0").IntVar(&c.verifyCommandFilesPercent)
+	cmd.Flag("verify-files-percent", "Randomly verify a percentage of files by downloading them [0.0 .. 100.0]").Default("0").Float64Var(&c.verifyCommandFilesPercent)
 	cmd.Action(svc.repositoryReaderAction(c.run))
 }
 
@@ -55,14 +55,14 @@ type verifier struct {
 	errors []error
 
 	errorsThreshold      int
-	downloadFilesPercent int
+	downloadFilesPercent float64
 }
 
 func (v *verifier) progressCallback(ctx context.Context, enqueued, active, completed int64) {
 	maybeTimeRemaining := ""
 
-	if est, ok := v.tt.Estimate(float64(completed), float64(enqueued)+float64(completed)); ok {
-		maybeTimeRemaining = fmt.Sprintf(" remaining %v (ETA %v)", est.Remaining, formatTimestamp(est.EstimatedEndTime))
+	if est, ok := v.tt.Estimate(float64(completed), float64(enqueued)); ok {
+		maybeTimeRemaining = fmt.Sprintf(", %.1f%% complete, remaining %v (ETA %v)", est.PercentComplete, est.Remaining, formatTimestamp(est.EstimatedEndTime))
 	}
 
 	log(ctx).Infof("Found %v objects, verifying %v, completed %v objects%v.", enqueued, active, completed, maybeTimeRemaining)
@@ -174,8 +174,8 @@ func (v *verifier) doVerifyObject(ctx context.Context, oid object.ID, path strin
 		}
 	}
 
-	//nolint:gomnd,gosec
-	if rand.Intn(100) < v.downloadFilesPercent {
+	//nolint:gosec
+	if 100*rand.Float64() < v.downloadFilesPercent {
 		if err := v.readEntireObject(ctx, oid, path); err != nil {
 			v.reportError(ctx, path, errors.Wrapf(err, "error reading object %v", oid))
 		}
@@ -194,9 +194,7 @@ func (v *verifier) readEntireObject(ctx context.Context, oid object.ID, path str
 	}
 	defer r.Close() //nolint:errcheck
 
-	_, err = iocopy.Copy(ioutil.Discard, r)
-
-	return errors.Wrap(err, "unable to read data")
+	return errors.Wrap(iocopy.JustCopy(ioutil.Discard, r), "unable to read data")
 }
 
 func (c *commandSnapshotVerify) run(ctx context.Context, rep repo.Repository) error {

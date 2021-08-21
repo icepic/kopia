@@ -15,6 +15,7 @@ import (
 
 	"github.com/kopia/kopia/internal/blobtesting"
 	"github.com/kopia/kopia/internal/clock"
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/internal/testlogging"
 	"github.com/kopia/kopia/internal/testutil"
 	"github.com/kopia/kopia/repo/blob"
@@ -26,7 +27,7 @@ const defaultCleanupAge = time.Hour
 
 var rcloneExternalProviders = map[string]string{
 	"GoogleDrive": "gdrive:/kopia",
-	// "OneDrive":    "onedrive:/kopia", broken
+	"OneDrive":    "onedrive:/kopia",
 }
 
 func mustGetRcloneExeOrSkip(t *testing.T) string {
@@ -77,7 +78,10 @@ func TestRCloneStorage(t *testing.T) {
 	// described in https://github.com/kopia/kopia/issues/624
 	for i := 0; i < 100; i++ {
 		eg.Go(func() error {
-			if _, err := st.GetBlob(ctx, blob.ID(uuid.New().String()), 0, -1); !errors.Is(err, blob.ErrBlobNotFound) {
+			var tmp gather.WriteBuffer
+			defer tmp.Close()
+
+			if err := st.GetBlob(ctx, blob.ID(uuid.New().String()), 0, -1, &tmp); !errors.Is(err, blob.ErrBlobNotFound) {
 				return errors.Errorf("unexpected error when downloading non-existent blob: %v", err)
 			}
 
@@ -129,7 +133,6 @@ func TestRCloneStorageInvalidFlags(t *testing.T) {
 }
 
 func TestRCloneProviders(t *testing.T) {
-	t.Parallel()
 	testutil.ProviderTest(t)
 
 	var (
@@ -150,6 +153,11 @@ func TestRCloneProviders(t *testing.T) {
 		rcloneArgs = append(rcloneArgs, "--config="+cfg)
 	}
 
+	rcloneArgs = append(rcloneArgs,
+		"--vfs-cache-max-size=100M",
+		"--vfs-cache-mode=full",
+	)
+
 	if len(rcloneArgs)+len(embeddedConfig) == 0 {
 		t.Skipf("Either KOPIA_RCLONE_EMBEDDED_CONFIG_B64 or KOPIA_RCLONE_CONFIG_FILE must be provided")
 	}
@@ -160,18 +168,27 @@ func TestRCloneProviders(t *testing.T) {
 		rp := rp
 
 		opt := &rclone.Options{
-			RemotePath:     rp,
-			RCloneExe:      rcloneExe,
-			RCloneArgs:     rcloneArgs,
-			EmbeddedConfig: embeddedConfig,
+			RemotePath:      rp,
+			RCloneExe:       rcloneExe,
+			RCloneArgs:      rcloneArgs,
+			EmbeddedConfig:  embeddedConfig,
+			Debug:           true,
+			ListParallelism: 16,
+			AtomicWrites:    true,
 		}
 
-		t.Run(name, func(t *testing.T) {
+		t.Run("Cleanup-"+name, func(t *testing.T) {
 			t.Parallel()
 
 			ctx := testlogging.Context(t)
 
 			cleanupOldData(ctx, t, opt, defaultCleanupAge)
+		})
+
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testlogging.Context(t)
 
 			// we are using shared storage, append a guid so that tests don't collide
 			opt.RemotePath += "/" + uuid.NewString()

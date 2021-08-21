@@ -7,6 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 
+	"github.com/kopia/kopia/internal/gather"
 	"github.com/kopia/kopia/repo/blob"
 )
 
@@ -18,9 +19,9 @@ type readonlyStorage struct {
 	base blob.Storage
 }
 
-func (s readonlyStorage) GetBlob(ctx context.Context, id blob.ID, offset, length int64) ([]byte, error) {
+func (s readonlyStorage) GetBlob(ctx context.Context, id blob.ID, offset, length int64, output *gather.WriteBuffer) error {
 	// nolint:wrapcheck
-	return s.base.GetBlob(ctx, id, offset, length)
+	return s.base.GetBlob(ctx, id, offset, length, output)
 }
 
 func (s readonlyStorage) GetMetadata(ctx context.Context, id blob.ID) (blob.Metadata, error) {
@@ -56,6 +57,11 @@ func (s readonlyStorage) ConnectionInfo() blob.ConnectionInfo {
 
 func (s readonlyStorage) DisplayName() string {
 	return s.base.DisplayName()
+}
+
+func (s readonlyStorage) FlushCaches(ctx context.Context) error {
+	// nolint:wrapcheck
+	return s.base.FlushCaches(ctx)
 }
 
 // NewWrapper returns a readonly Storage wrapper that prevents any mutations to the underlying storage.

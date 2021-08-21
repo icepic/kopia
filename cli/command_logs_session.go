@@ -12,6 +12,7 @@ import (
 
 	"github.com/kopia/kopia/internal/clock"
 	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/content"
 )
 
 type logSessionInfo struct {
@@ -69,7 +70,7 @@ func getLogSessions(ctx context.Context, st blob.Reader) ([]*logSessionInfo, err
 
 	var allSessions []*logSessionInfo
 
-	if err := st.ListBlobs(ctx, "_log_", func(bm blob.Metadata) error {
+	if err := st.ListBlobs(ctx, content.TextLogBlobPrefix, func(bm blob.Metadata) error {
 		parts := strings.Split(string(bm.BlobID), "_")
 
 		// nolint:gomnd
@@ -80,6 +81,7 @@ func getLogSessions(ctx context.Context, st blob.Reader) ([]*logSessionInfo, err
 
 		id := parts[2] + "_" + parts[3]
 
+		// nolint:gomnd
 		startTime, err := strconv.ParseInt(parts[4], 10, 64)
 		if err != nil {
 			log(ctx).Errorf("invalid start time - skipping unrecognized log: %v", bm.BlobID)
@@ -88,6 +90,7 @@ func getLogSessions(ctx context.Context, st blob.Reader) ([]*logSessionInfo, err
 			return nil
 		}
 
+		// nolint:gomnd
 		endTime, err := strconv.ParseInt(parts[5], 10, 64)
 		if err != nil {
 			log(ctx).Errorf("invalid end time - skipping unrecognized log: %v", bm.BlobID)

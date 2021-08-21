@@ -5,13 +5,14 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/require"
 
 	"github.com/kopia/kopia/internal/gather"
+	"github.com/kopia/kopia/internal/providervalidation"
 	"github.com/kopia/kopia/repo/blob"
 )
 
@@ -81,8 +82,30 @@ func VerifyStorage(ctx context.Context, t *testing.T, r blob.Storage) {
 		}
 	})
 
-	AssertListResults(ctx, t, r, "", blocks[0].blk, blocks[1].blk, blocks[2].blk, blocks[3].blk, blocks[4].blk)
-	AssertListResults(ctx, t, r, "ab", blocks[0].blk, blocks[2].blk, blocks[3].blk)
+	t.Run("ListBlobs", func(t *testing.T) {
+		errExpected := errors.New("expected error")
+
+		t.Run("ListErrorNoPrefix", func(t *testing.T) {
+			t.Parallel()
+			require.ErrorIs(t, r.ListBlobs(ctx, "", func(bm blob.Metadata) error {
+				return errExpected
+			}), errExpected)
+		})
+		t.Run("ListErrorWithPrefix", func(t *testing.T) {
+			t.Parallel()
+			require.ErrorIs(t, r.ListBlobs(ctx, "ab", func(bm blob.Metadata) error {
+				return errExpected
+			}), errExpected)
+		})
+		t.Run("ListNoPrefix", func(t *testing.T) {
+			t.Parallel()
+			AssertListResults(ctx, t, r, "", blocks[0].blk, blocks[1].blk, blocks[2].blk, blocks[3].blk, blocks[4].blk)
+		})
+		t.Run("ListWithPrefix", func(t *testing.T) {
+			t.Parallel()
+			AssertListResults(ctx, t, r, "ab", blocks[0].blk, blocks[2].blk, blocks[3].blk)
+		})
+	})
 
 	t.Run("OverwriteBlobs", func(t *testing.T) {
 		for _, b := range blocks {
@@ -91,10 +114,7 @@ func VerifyStorage(ctx context.Context, t *testing.T, r blob.Storage) {
 			t.Run(string(b.blk), func(t *testing.T) {
 				t.Parallel()
 
-				if err := r.PutBlob(ctx, b.blk, gather.FromSlice(b.contents)); err != nil {
-					t.Errorf("can't put blob: %v", err)
-				}
-
+				require.NoErrorf(t, r.PutBlob(ctx, b.blk, gather.FromSlice(b.contents)), "can't put blob: %v", b)
 				AssertGetBlob(ctx, t, r, b.blk, b.contents)
 			})
 		}
@@ -109,29 +129,25 @@ func VerifyStorage(ctx context.Context, t *testing.T, r blob.Storage) {
 			t.Run(string(b.blk), func(t *testing.T) {
 				t.Parallel()
 
-				if err := r.SetTime(ctx, b.blk, ts); errors.Is(err, blob.ErrSetTimeUnsupported) {
+				err := r.SetTime(ctx, b.blk, ts)
+				if errors.Is(err, blob.ErrSetTimeUnsupported) {
 					return
 				}
+
+				require.NoError(t, err)
 
 				md, err := r.GetMetadata(ctx, b.blk)
 				if err != nil {
 					t.Errorf("unable to get blob metadata")
 				}
 
-				if got, want := md.Timestamp, ts; !got.Equal(want) {
-					t.Errorf("invalid time after SetTme(): %vm want %v", got, want)
-				}
+				require.True(t, md.Timestamp.Equal(ts), "invalid time after SetTme(): %vm want %v", md.Timestamp, ts)
 			})
 		}
 	})
 
-	if err := r.DeleteBlob(ctx, blocks[0].blk); err != nil {
-		t.Errorf("unable to delete block: %v", err)
-	}
-
-	if err := r.DeleteBlob(ctx, blocks[0].blk); err != nil {
-		t.Errorf("invalid error when deleting deleted block: %v", err)
-	}
+	require.NoError(t, r.DeleteBlob(ctx, blocks[0].blk))
+	require.NoError(t, r.DeleteBlob(ctx, blocks[0].blk))
 
 	AssertListResults(ctx, t, r, "ab", blocks[2].blk, blocks[3].blk)
 	AssertListResults(ctx, t, r, "", blocks[1].blk, blocks[2].blk, blocks[3].blk, blocks[4].blk)
@@ -149,11 +165,19 @@ func AssertConnectionInfoRoundTrips(ctx context.Context, t *testing.T, s blob.St
 	}
 
 	ci2 := s2.ConnectionInfo()
-	if !reflect.DeepEqual(ci, ci2) {
-		t.Errorf("connection info does not round-trip: %v vs %v", ci, ci2)
-	}
+	require.Equal(t, ci, ci2)
 
-	if err := s2.Close(ctx); err != nil {
-		t.Errorf("unable to close storage: %v", err)
-	}
+	require.NoError(t, s2.Close(ctx))
+}
+
+// TestValidationOptions is the set of options used when running providing validation from tests.
+// nolint:gomnd
+var TestValidationOptions = providervalidation.Options{
+	MaxClockDrift:           3 * time.Minute,
+	ConcurrencyTestDuration: 15 * time.Second,
+	NumPutBlobWorkers:       3,
+	NumGetBlobWorkers:       3,
+	NumGetMetadataWorkers:   3,
+	NumListBlobsWorkers:     3,
+	MaxBlobLength:           10e6,
 }

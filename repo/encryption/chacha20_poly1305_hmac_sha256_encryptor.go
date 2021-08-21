@@ -9,9 +9,13 @@ import (
 
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/chacha20poly1305"
+
+	"github.com/kopia/kopia/internal/gather"
 )
 
 const chacha20poly1305hmacSha256EncryptorOverhead = 28
+
+const chacha20KeyDerivationSecretSize = 32
 
 type chacha20poly1305hmacSha256Encryptor struct {
 	hmacPool *sync.Pool
@@ -36,22 +40,22 @@ func (e chacha20poly1305hmacSha256Encryptor) aeadForContent(contentID []byte) (c
 	return chacha20poly1305.New(key)
 }
 
-func (e chacha20poly1305hmacSha256Encryptor) Decrypt(output, input, contentID []byte) ([]byte, error) {
+func (e chacha20poly1305hmacSha256Encryptor) Decrypt(input gather.Bytes, contentID []byte, output *gather.WriteBuffer) error {
 	a, err := e.aeadForContent(contentID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return aeadOpenPrefixedWithNonce(output, a, input, contentID)
+	return aeadOpenPrefixedWithNonce(a, input, contentID, output)
 }
 
-func (e chacha20poly1305hmacSha256Encryptor) Encrypt(output, input, contentID []byte) ([]byte, error) {
+func (e chacha20poly1305hmacSha256Encryptor) Encrypt(input gather.Bytes, contentID []byte, output *gather.WriteBuffer) error {
 	a, err := e.aeadForContent(contentID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return aeadSealWithRandomNonce(output, a, input, contentID)
+	return aeadSealWithRandomNonce(a, input, contentID, output)
 }
 
 func (e chacha20poly1305hmacSha256Encryptor) Overhead() int {
@@ -60,7 +64,7 @@ func (e chacha20poly1305hmacSha256Encryptor) Overhead() int {
 
 func init() {
 	Register("CHACHA20-POLY1305-HMAC-SHA256", "CHACHA20-POLY1305 using per-content key generated using HMAC-SHA256", false, func(p Parameters) (Encryptor, error) {
-		keyDerivationSecret, err := deriveKey(p, []byte(purposeEncryptionKey), 32)
+		keyDerivationSecret, err := deriveKey(p, []byte(purposeEncryptionKey), chacha20KeyDerivationSecretSize)
 		if err != nil {
 			return nil, err
 		}
