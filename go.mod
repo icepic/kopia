@@ -3,6 +3,7 @@ module github.com/kopia/kopia
 go 1.16
 
 require (
+	cloud.google.com/go/iam v0.1.1 // indirect
 	cloud.google.com/go/storage v1.16.0
 	contrib.go.opencensus.io/exporter/prometheus v0.3.0
 	github.com/Azure/azure-pipeline-go v0.2.3
@@ -57,12 +58,12 @@ require (
 	golang.org/x/exp v0.0.0-20210220032938-85be41e4509f
 	golang.org/x/mod v0.4.2
 	golang.org/x/net v0.0.0-20210614182718-04defd469f4e
-	golang.org/x/oauth2 v0.0.0-20210628180205-a41e5a781914
+	golang.org/x/oauth2 v0.0.0-20211104180415-d3ed0bb246c8
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c
+	golang.org/x/sys v0.0.0-20220114195835-da31bd327af9
 	golang.org/x/term v0.0.0-20210317153231-de623e64d2a6
-	google.golang.org/api v0.52.0
-	google.golang.org/grpc v1.39.0
+	google.golang.org/api v0.66.0
+	google.golang.org/grpc v1.40.1
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/ini.v1 v1.62.0 // indirect
 	gopkg.in/kothar/go-backblaze.v0 v0.0.0-20210124194846-35409b867216
