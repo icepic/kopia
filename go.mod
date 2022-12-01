@@ -53,14 +53,14 @@ require (
 	github.com/zeebo/blake3 v0.2.0
 	go.opencensus.io v0.23.0
 	gocloud.dev v0.23.0
-	golang.org/x/crypto v0.0.0-20210506145944-38f3c27a63bf
+	golang.org/x/crypto v0.0.0-20210921155107-089bfa567519
 	golang.org/x/exp v0.0.0-20210220032938-85be41e4509f
-	golang.org/x/mod v0.4.2
-	golang.org/x/net v0.0.0-20210614182718-04defd469f4e
+	golang.org/x/mod v0.7.0
+	golang.org/x/net v0.0.0-20220722155237-a158d28d115b
 	golang.org/x/oauth2 v0.0.0-20210628180205-a41e5a781914
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c
-	golang.org/x/term v0.0.0-20210317153231-de623e64d2a6
+	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
+	golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f
+	golang.org/x/term v0.0.0-20210927222741-03fcf44c2211
 	google.golang.org/api v0.52.0
 	google.golang.org/grpc v1.39.0
 	google.golang.org/protobuf v1.27.1
